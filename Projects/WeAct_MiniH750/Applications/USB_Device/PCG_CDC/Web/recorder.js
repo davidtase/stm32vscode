@@ -189,9 +189,9 @@ export function startSession({ ecgPort, pcgPort, log, now, onPcg, onEcg, onLost 
     });
 
   log.event(now(), { e: 'start', format: 1, wall: Date.now(), note: ALIGN_NOTE, pcg_hz: 1000, ecg_frame_hz: 500, ecg_1k_hz: 1000 });
-  const loops = Promise.all([watch('ecg', ecg, ecgChunk), watch('pcg', pcg, pcgChunk)]);
+  const loops = Promise.all([ecgPort && watch('ecg', ecg, ecgChunk), pcgPort && watch('pcg', pcg, pcgChunk)]);
   // send() swallows a dead port, so without the check this could land after the last flush of a session that ended itself
-  send(...START).then(() => {
+  if (ecgPort) send(...START).then(() => {
     if (!ecg.lost) log.event(now(), { e: 'ecg-start-sent' });
   });
 

@@ -1049,6 +1049,7 @@ Commands run from `P` unless they say "repo root". `$S` is a scratch folder outs
 | S14 | Executioner | None |
 | S15 | Executioner, then the user in Chrome | Both devices, one short recording |
 | S16 | Executioner, then the user with headphones | Both devices, one short recording |
+| S17 | Executioner, then the user | Both devices, short runs in each choice |
 
 S2–S7 all come before the flash so that the viewers work the moment the board changes, and the user disconnects once.
 
@@ -1459,6 +1460,43 @@ S2–S7 all come before the flash so that the viewers work the moment the board 
   **Step 6c:** a pass answers its open question, how the upsampled audio sounds, so tick 6c with that note. Its `index.html`-only items (volume slider, Disconnect and reconnect, the buffered and underrun numbers) go with it, because the user records from this page. Its 10-minute run counts only if the user listens that long.
 
   **Not in this step:** a filter choice, an audio stats line, audio outside a recording.
+
+- [x] S17. **Measure or Record, and ECG, PCG or Both (executioner, then the user).** User request, 2026-11-12: "I want to be able to select between measure without recording and recording. Also select between ECG lead II, PCG or both. This is because I will show a quick measure at event 'Noche de los museos' here in Buenos Aires." Files: `Web/recorder.html`, `Web/recorder.js` (two lines), `HOW_TO_RECORD.md`. The record format and the loader stay untouched.
+  **Result (2026-11-12):** Code done, and **the user's check is still open**. `page syntax OK`, and `pcg_parser` 10, `pcg_audio` 11, `upsample` 5, `ecg_dsp` 11 and `recorder` 17, all `fail 0`. `Tools/load_recording.py` keeps sha256 `21251db5…`.
+  - **Record + Both writes the same bytes:** a scratch session through `HEAD`'s `recorder.js` and the new one, same inputs, same clock, gave 37 702 identical bytes and the same 7 ECG writes (START, STOP). PCG only sends nothing to the ECG port and logs no `ecg-start-sent`. Each check failed on an injected break.
+  - **`$S/harness_recorder_page.mjs` no longer exists:** the scratchpad was cleared, and the harness was never in the repo. Its 27 scenarios and 55 mutants were not re-run. A new compact scratch harness, `$S/s17_page.mjs`, runs the real page script with a `localStorage` stub and passes 5 of 5: defaults, a bad or unreadable store, saving and locking; Measure + Both (no folder, no files, the Measure texts, the tab closes freely); ECG only and PCG only (one port opened, no START for PCG only, a loss ends the session); Record + PCG only (the loader gives `pcg_frames` above 0 and `ecg_frames` 0); and Record + Both with today's texts and `stats` line. Of 12 injected breaks it catches 11 with a `FAIL` line and one through a crash. The twelfth, START sent with no ECG port, is invisible on the page and is caught by the byte check above.
+  - **Known false flag, loader left alone:** with no ECG, the summary's `ecg_1k_ok` reads false, because `0 ≠ 2·0 − 1`.
+  - **One change beyond the step:** the two fieldsets make the top bar three rows at 1280 px, 81 px taller, so the canvas height went from `calc(50vh - 175px)` to `calc(50vh - 216px)`. In Chrome, both cards again fit a 1080p window (937 px viewport) with a warning, ending at 929, and an 807 px viewport, ending at 799.
+  - **`HOW_TO_RECORD.md`:** the line opens item 3 of section 3, before "Click **Start**", so the numbering stays.
+  - **One signal, a taller card (user, 2026-11-12):** after testing Measure and Record with PCG only, "it's working", the user asked: "I want to increase a little more the window size when I'm measuring only one signal." When the other card is `hidden`, the shown card's canvas is `calc(100vh - 359px)`, which adds the hidden card's 57 px and the 16 px gap to both canvases' heights. CSS keyed to `.card[hidden]`, plus one line: `render()` sets `dirty`, because `draw()` sizes the canvas pixels only when it runs, so a card hidden at load would otherwise keep its old height, stretched. Measured in Chrome through the real path, with no forced redraw: the canvas is 578 CSS px and 578 pixels in a 1920×1080 window (937 px viewport), and 298 and 298 at 1280×800. With a warning, the single card ends at 887 of 937 px, and at 607 of 657 at 1280×800. The Both layout measures as before, 867 and 910 with a warning. `page syntax OK`, and `s17_page.mjs` 5 of 5.
+  - **Not done:** not run in a real Chrome with the devices.
+  1. **`startSession` today needs both ports.** `readPort(null)` throws, so `loops` rejects and the page lands in Retry save. `send(...START)` to no port is swallowed, but it still logs `ecg-start-sent`. The change: `Promise.all([ecgPort && watch('ecg', …), pcgPort && watch('pcg', …)])`, and `send(...START)` only `if (ecgPort)`. `halt()` stays, because its `.catch` already covers a missing ECG port. With both ports the calls and their order are unchanged, so Record + Both writes the same bytes. **No log needs no change:** Measure passes `{ add() {}, event() {}, flush: async () => true, stats: { saved: 0, unsaved: 0, error: '' } }`.
+  2. **The loader with one device works today** (planner's synthetic PCG-only and ECG-only folders: summary, `--export` and verification all pass). One false flag stays: with no ECG, `ecg_1k_ok` reads false, because `0 ≠ 2·0 − 1`.
+  3. **Controls:** two `<fieldset>`s of native radios in the top bar, Mode (`modeMeasure`, `modeRecord`) and Signals (`sigEcg`, `sigPcg`, `sigBoth`), shown as S15-style segmented pills. The radio stays focusable, visually hidden, never `display: none`. `render()` sets `disabled` on both fieldsets unless `idle`. At load the script sets `.checked` from `localStorage` (`try`/`catch`, values checked against the allowed list), else Measure and Both. A `change` saves them. The other card (`cardEcg`, `cardPcg`) gets `hidden`. Audio and Volume are hidden unless PCG is in.
+  4. **Behaviour:**
+     - **Start** opens only the chosen ports. Start is enabled when those are found, and the other device is not touched. Record works as today. Measure asks for no folder and creates no log or files.
+     - **Stop** sends the ECG stop bytes only when ECG is in.
+     - **A lost device:** with Both, as today, and the other stream continues. With one device, the session ends itself, through `ended()` as today.
+     - **`beforeunload`** blocks only in Record, while running or unsaved. Measure never blocks.
+     - **Warnings and lines:** "No … for over 3 s" and the `leads` line appear only for a chosen stream.
+  5. **Texts in Measure:** `Measuring, nothing is saved. Click Stop to end it.`, `Stopping…`, `Measured <m:ss>. Nothing was saved.`, the lost warning without "It stays out of this recording.", and `stats` without "files saved" and with "measured" for "recorded". In both modes, `stats` leaves out the absent stream's parts. Record texts stay as they are.
+  6. **`HOW_TO_RECORD.md`, one line, before "Click Start" in section 3:** "Pick **Record** to save, because the page starts in **Measure**, which shows the chosen signals (ECG, PCG or Both) live and saves nothing. Both choices are remembered, and locked while running."
+
+  **Checks:**
+  - S7's `page syntax OK`.
+  - The five node suites, `fail 0`, counts unchanged.
+  - **Harness:** in `$S/harness_recorder_page.mjs`, stub `localStorage.getItem` to return Record + Both, or the existing 25 scenarios run in Measure and fail. `checked` and `hidden` need no stub.
+  - **New harness scenarios:**
+    - Measure + Both: no picker call, no files, the Measure texts, and `beforeunload` false while running.
+    - ECG only and PCG only: only that port is opened. PCG only writes no START bytes. A loss ends the session.
+    - Record + PCG only: the saved files give the loader's `pcg_frames` above 0 and `ecg_frames` 0.
+    - Record + Both: the existing scenarios, unchanged.
+
+  **Acceptance (the user, a few minutes, sensors stay on):**
+  - Measure + Both: no folder dialog, both traces, and audio works.
+  - ECG only and PCG only: one card each.
+  - The tab closes without a prompt in Measure.
+  - Record + Both: a short recording shows `Saved …`, and the tester's loader summary has empty `errors`.
 
 ## Not doing
 
