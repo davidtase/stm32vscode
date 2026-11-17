@@ -1525,3 +1525,494 @@ S2–S7 all come before the flash so that the viewers work the moment the board 
 - **Your ears:** done on 2026-11-06 on the recorder page, see S16.
 - **Answered 2026-11-04:** the 3 V limit on the PCG PCB's output: a voltage divider on the PCB limits it to 3 V by design (Decisions, "PCG front end"). This does not change S11 item 1: the PCB stays live when the board has no power, so do not unplug the board's USB-C with the PCB connected to PA6.
 - **Answered 2026-11-04:** the `index.html` Connect fix: yes. It went in with S3, and S9 item 4 checks it.
+
+
+# PLAN: Electron recorder app
+
+**Goal:** run the existing recorder page, unchanged, inside an Electron window started with `pnpm start`, as a new folder next to `Web/`. The browser recorder, `ecg.html`, `index.html`, the firmware, the recording format and `Tools/load_recording.py` stay exactly as they are.
+
+**The user's request (2026-11-17), verbatim:** "I want to re-build the recorder browser app on Electron like VS Code, for handling more RAM memory."
+
+**Hard constraint (user, 2026-11-17):** nothing that exists today may change. The Electron app is an addition. Every step below has a "browser still works" pass/fail item (**B**, defined once under Steps). A shared file may change only if the step says so, and then the browser behaviour stays identical.
+
+`P` = `Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC`. ✅ = read from the code. 🔶 = estimated or from documentation, not tried here.
+
+## Questions for the user (none blocks the plan)
+
+1. **What does "more RAM" mean for you?** The finding below says the page does not hold the recording in RAM, so Electron will not give more of it. Guesses and my default:
+   - **Longer recordings:** already unlimited by RAM today (disk only). Nothing to do. **Default.**
+   - **A display window longer than 10 s:** needs `RING` and the Window slider's maximum edited in `Web/recorder.html`, which is a shared file. Not done unless you ask. A 60 s window would be 2 × 60000 floats = 480 KB.
+   - **A higher rate or more channels:** needs firmware and a new format. Not in this plan.
+   - **You saw a crash or a limit:** tell me what happened (tab "Aw, Snap", a stall, a failed save). That would change the plan.
+2. **Folder picker:** default is Electron's own `showDirectoryPicker`, as in Chrome, with the page unchanged. If it fails or refuses a folder you need, step E3 adds a small preload so the Electron main process writes the files. OK?
+3. **`pnpm add -D --save-exact electron`** downloads about 100 to 250 MB into `P/Electron/node_modules` (git-ignored). OK to run?
+
+## What holds memory today ✅ (read from `Web/recorder.js` and `recorder.html`)
+
+| Thing | Size | Grows with recording length? |
+| --- | --- | --- |
+| Display rings, `RING = 10000` Float32, one per trace | 2 × 40 KB | No: circular, 10 s at 1000 Hz, the Window bar's maximum |
+| Open segment in `createLog` | up to 256 KB (`SEGMENT_BYTES`) | No: rolled into a Blob and written as `NNNNN.ecgpcg` |
+| Blobs waiting to be saved (`queue`) | normally 1 or 2 segments, about 0.64 segments/s at 165 KB/s | **Only if saving fails.** The code says so: "unsaved segments stay in memory with no cap, about 600 MB per hour of failed writes" |
+| Per-frame `lo` and `hi` arrays in `draw()` | canvas width × 4 B × 2 | No: garbage each frame |
+| ECG parser, filter, upsampler, audio worklet | a few KB | No |
+
+- **Conclusion:** a one-hour recording (about 600 MB) goes to disk in 256 KB pieces and costs about 0.3 MB of page memory, plus the browser's own overhead. The real limits today are disk space, the folder picker's restrictions (Chrome may refuse `~/Documents`), a dropped tab or sleeping PC, and the 10 s window. 🔶 I have not measured the tab's memory (Chrome's Shift+Esc task manager would show it).
+- **What Electron changes:**
+  - 🔶 **Renderer heap:** same Chromium and V8, so the same heap limit. Electron does not raise it.
+  - 🔶 **Main process:** Node Buffers live outside the V8 heap, so a main-process writer is limited by disk only. That does not matter here, because the page already streams.
+  - **What it does give:** no "Allow device" click for known devices, a dialog on a restricted folder instead of Chrome's refusal 🔶, no throttling of a hidden window (`backgroundThrottling: false`), and a window of its own that is not a tab you can close by accident.
+  - **It also adds risks, all handled below:** `beforeunload` behaves differently, Ubuntu 24.04's sandbox restriction, module scripts over `file://`.
+- **The recording buffer does not need to move.** Moving writes to the main process (E3, only if needed) changes who calls `write`, not how much RAM the page uses.
+
+## Decisions
+
+- **Where it lives:** new folder `P/Electron/` with `package.json`, `main.js` and a `.gitignore` containing `node_modules`. The page is not copied: `main.js` serves `P/Web/` itself, so there is one copy of the page for both versions. Reason: the user wants nothing existing to change, and a copy would drift.
+- **How the page loads:** `main.js` starts a tiny Node `http` server (built in, no dependency) on `127.0.0.1:8002`, serving `../Web` read-only, and opens `http://127.0.0.1:8002/recorder.html`. Reason: the page uses ES modules and `audioWorklet.addModule('pcg_audio.js')`, which may fail over `file://` 🔶, and an http origin is exactly what Chrome sees today. Port 8002, so it does not clash with the browser setup on 8001. The server refuses paths outside `Web/` (normalise, check the prefix).
+- **Serial:** `session.setDevicePermissionHandler` returns true for `deviceType === 'serial'` of the two known devices (0483:5740, 04d8:00df, matched by vendor and product id, so no other serial port is exposed), so `navigator.serial.getPorts()` finds them with no click. `select-serial-port` picks the first listed port, so the page's "Allow device" button still works. 🔶 Electron docs for these two handlers read; the exact fields of `details.device` are not checked and E2 settles them.
+- **Closing the window:** Electron swallows a `beforeunload` that calls `preventDefault()` without asking anything, so closing during a Record would just do nothing. `main.js` handles `will-prevent-unload` with one `dialog.showMessageBoxSync` (Stay or Leave). Measure never blocks, so it closes freely, as today.
+- **Window options:** `backgroundThrottling: false`; defaults otherwise (`contextIsolation` on, no `nodeIntegration`, no preload unless E3b is needed). Reason: the page is local and trusted, and needs no Node.
+- **Run:** `cd P/Electron && pnpm start`, where `start` is `electron . --no-sandbox`. Reason: Ubuntu 24.04 (kernel 6.8) usually blocks Electron's sandbox helper for a plain pnpm install 🔶. The window loads only our local page, so no sandbox is an accepted shortcut. If it starts without the flag, remove it. Install on a fresh checkout with `pnpm install --frozen-lockfile`: Electron is pinned to 45.3.3 (no `^`), `packageManager` is `pnpm@12.21.0`, no dependency runs install scripts (pnpm blocks them by default and none is allowed), and Electron downloads its binary on the first `pnpm start`.
+- **Packaging: no.** Electron-builder, an AppImage or an installer are not needed for one machine. Upgrade only if the user asks.
+- **Tests:** none new, as asked. The existing `Tests/recorder_test.mjs` run as the "browser still works" check.
+- **Recordings:** the user picks the folder in the picker, outside the repo, as today. No recording path is written in the repo, and `Electron/` never gets one.
+
+## Steps
+
+**B, the "browser still works" check, run at the end of every step, all must pass:**
+- **B1:** `git status --porcelain` lists nothing under `P/Web/`, `P/Tools/`, `P/Tests/`, `P/Src/`, `P/Inc/`. (E6 adds one change in `HOW_TO_RECORD.md`, listed there.)
+- **B2:** from `P`, `node --test Tests/recorder_test.mjs` shows `fail 0` and the same `pass` count as the baseline taken in E1.
+- **B3:** `python3 -m http.server -b 127.0.0.1 -d Web 8001` (the guide's command) serves `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8001/recorder.html` as 200. Stop it afterwards.
+
+- [x] **E1. Baseline.** (Done 2026-11-17: `pass 17`, `fail 0`; already untracked and the user's: `Posters/`, `PCB_piezo-filter_v3.net`, `logo_csc_fondo_oscuro_color.pdf`; `PLAN.md` already modified.) Before touching anything, run B2 and write the `pass` count in the step's tick line. Run `git status --porcelain` and note what was already untracked (`Posters/`, the PCB net and the logo PDF are the user's, not ours). No files touched.
+  **Acceptance:** the baseline is written down. B1 to B3 pass.
+- [x] **E2. Scaffold and window.** (Done 2026-11-17: electron 45.3.3 installed; window shows the page; cmp silent; traversal URLs 404; B1 to B3 pass, `pass 17`.) (Needs the user's OK for `pnpm add`, Questions 3.) New `P/Electron/package.json` (`"main": "main.js"`, `"start": "electron . --no-sandbox"`, `electron` as the only devDependency), `P/Electron/.gitignore` (`node_modules`), `P/Electron/main.js` with the static server and the window only. Run `pnpm add -D --save-exact electron` in `P/Electron`.
+  **Acceptance:** `pnpm start` opens a window showing the recorder page with "Not recording." and the Mode, Signals, Window and Volume controls; `curl -s http://127.0.0.1:8002/recorder.js | cmp - P/Web/recorder.js` is silent; `curl 'http://127.0.0.1:8002/../../README.md'` and `curl --path-as-is http://127.0.0.1:8002/../README.md` return 404 or 403. The page is not the "no Web Serial" message. B1 to B3. (If the module scripts or the page fail to load, the console in DevTools, `Ctrl+Shift+I`, says why; no fallback is planned because http is already the safe route.)
+- [x] **E3. Serial permissions (devices plugged in by the user).** (Code done 2026-11-17: `main.js` has the three handlers; app starts with no error, page 200; B1 to B3 pass, `pass 17`. The live-board Acceptance is still the tester's.) Add the `setDevicePermissionHandler`, the `setPermissionCheckHandler` for `serial` and the `select-serial-port` handler to `main.js`.
+  **Acceptance:** with the PCG board plugged in (`lsusb | grep 0483:5740`), the page's device line says "PCG board: found" with no Allow click; **Measure + PCG** shows a live trace and the stats line shows about 1000 PCG samples/s; **Stop** ends it. The same with the ECG module (`04d8:00df`) when it is attached: "ECG module: found", trace appears (lead II at 500 frames/s). Unplugging a device updates the line (the page listens to `connect` and `disconnect` 🔶). Allow device still opens and answers. B1 to B3.
+- [ ] **E4. Record writes files.** Try Electron's own `showDirectoryPicker` first, with no code change. Add the `will-prevent-unload` dialog to `main.js`.
+  **Acceptance:** **Record + PCG only**, Start, choose a folder outside the repo, run 30 s, Stop: "Saved …" shows, the folder `ecgpcg-YYYYMMDD-HHMMSS` holds `00001.ecgpcg …` of about 256 KB each, no `.crswap` is left. Closing the window during the run shows the Stay or Leave dialog; Measure closes with no dialog. `python3 -I -B Tools/load_recording.py "<folder>"` prints a summary with empty `errors` and `pcg_frames` above 0. B1 to B3.
+  - **E4b, only if the picker fails or refuses the folder:** add `P/Electron/preload.js` (not loaded by the browser) that replaces `window.showDirectoryPicker` with a stand-in exposing `name`, `getDirectoryHandle`, `getFileHandle`, `createWritable` (`write`, `close`, `abort`) and forwarding each segment over `ipcRenderer.invoke` to `fs.writeFile` in the main process. This moves writing to the main process, and the page is still unchanged. Same Acceptance.
+- [ ] **E5. Audio, Window and Volume.** No code expected; this step checks them in Electron. If `addModule` or the autoplay rule fails, set `autoplayPolicy: 'no-user-gesture-required'` in `webPreferences` and say so.
+  **Acceptance (user, headphones only, computer volume low, see HOW_TO_RECORD.md):** Measure + PCG, **Start audio** plays the heartbeat, **Volume** moves between 0 and 300 %, **Window** changes the seconds on screen from 1 to 10 and the trace follows. B1 to B3.
+- [ ] **E6. Parity run and guide.** Add a short "Electron version" section to `HOW_TO_RECORD.md` (the only shared file this plan edits, an addition: how to run `pnpm start`, port 8002, nothing else changes). Then the comparison under "Unchanged checklist".
+  **Acceptance:** the checklist below is all pass. `git diff --stat` lists `HOW_TO_RECORD.md` and `PLAN.md` as changed, plus the new `P/Electron/` files, and nothing else. B1 to B3.
+
+## Unchanged checklist for the tester
+
+The page files are served from the same `Web/` folder, so the code is the same bytes. These rows check that Electron itself did not change behaviour.
+
+| Feature | How the tester checks it | Pass |
+| --- | --- | --- |
+| Page, helpers, `ecg.html`, `index.html`, firmware, loader | `git status --porcelain` and `git diff --stat` show no change under `P/Web`, `P/Tools`, `P/Src`, `P/Inc`, `P/Tests` | empty |
+| Existing tests | from `P`: `node --test Tests/recorder_test.mjs` | `fail 0`, count equal to E1 |
+| Browser version | the guide's server on 8001, Chrome, `recorder.html` loads, Measure + PCG shows a trace | yes |
+| Measure | Electron, Measure + Both or the attached device: traces, no folder dialog, no files made | yes |
+| ECG / PCG / Both | each choice shows only its card; the choice is remembered after quitting and restarting the app (`localStorage` on port 8002) | yes |
+| Window bar | 1 to 10 s | yes |
+| Start audio, Volume | audible, 0 to 300 % | yes |
+| Record file format | one 30 s Record + PCG in Electron and one in Chrome, same Signals: both folders hold `NNNNN.ecgpcg` files, each about 256 KB except the last; `load_recording.py --json` on both gives the same keys, empty `errors`, `pcg_hz` 1000, and bytes per second within 5 % of each other (about 165 KB/s with both signals, less with PCG only) | yes |
+| Four-file export | `load_recording.py "<Electron folder>" --export` writes `pcg.npy`, `ecg_raw.npy`, `ecg_filtered.npy`, `timestamps.npz` (with ECG attached; with PCG only, as today's PCG-only behaviour) | same as the Chrome folder |
+| Closing during Record | the dialog appears, Stay keeps recording, Leave ends the app (about the last 1.6 s are lost, as in the browser) | yes |
+
+## If time is short
+
+| Keep | Drop |
+| --- | --- |
+| E1 baseline, E2 window, E3 serial, E4 Record with the loader check, every B | E5 audio check (code is unchanged, so it probably works) |
+| The `will-prevent-unload` dialog | The ECG-attached repeat of the parity run (PCG only is enough) |
+| `--no-sandbox` | The `HOW_TO_RECORD.md` section (put the run line in the tick line instead) |
+
+## Not doing
+
+- Packaging (electron-builder, AppImage, installer, auto-update), a tray icon, menus, an icon, code signing.
+- A rewrite of the page, a copy of it, a bundler, TypeScript, any framework, `node-serialport` (Electron's Web Serial already gives what the page uses).
+- Raising the 10 s window, the rate, or the number of channels (see Question 1).
+- A cap on the unsaved queue, a single-file recording, any change to the format or the loader.
+- New tests, drills or diagnostics beyond B and the checklist.
+- Windows or macOS support: Linux only, as the user's machine.
+
+## Needs the user
+
+- **Approval** to run `pnpm add -D --save-exact electron` in `P/Electron` (Question 3), and answers to Questions 1 and 2.
+- **Physical, for E3 to E6:** plug the PCG board (and the ECG module if you want ECG) and put the sensor on as usual. Sensor and electrodes stay where they are: nothing in this plan asks you to move them. For E5 wear headphones, speaker never. The recordings go to a folder you choose outside the repo.
+- **Do not run the browser recorder and the Electron app at the same time:** each serial port opens in one place only.
+- **You should know, no action needed:** this does not change how much RAM the recorder uses, because it already writes to disk as it goes. If the real problem is something else, the answer to Question 1 will say.
+
+
+# PLAN: recording viewer in the Electron app
+
+**Goal:** open a saved ECG + PCG recording folder in the Electron app and see lead II and PCG stacked on one time axis, with zoom, pan and a time readout, from the files on disk and with no board attached.
+
+**The user's request (2026-11-17), verbatim except the path:** "Now I want to visualize both ECG and PCG recordings in the new app but this functionality don't exist still, so add it. There are a recording in <folder path left out on purpose, see below>"
+
+**Hard constraint (user, 2026-11-17):** nothing that exists may be affected. The viewer is an addition: new files and a new entry point. The recorder page, the firmware, the format, `Tools/load_recording.py` and every other existing file keep their bytes. The only existing files this plan touches are two, both by adding lines only, and Questions 5 and 6 ask about them. The recording is read-only: nothing here writes, renames or deletes in it. **The recording's path and folder name are never written in the repo**: it is "the user's recording" below, and the page takes its folder from a folder picker.
+
+`P` = `Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC`. Verified = measured here on the user's recording with read-only scripts kept outside the repo. 🔶 = estimated or from documentation, not tried here. **No hardware is needed or used by any step.**
+
+## Questions for the user (none blocks the plan; the default is what gets built)
+
+1. **Where do the viewer files live?** Default: new files in `P/Web/` (`viewer.html`, `viewer_data.js`), served by the Electron server already and also by the guide's Python server on 8001, so it can be tried in Chrome too. Alternative: only inside `P/Electron/`, which means `main.js` would have to serve a second folder. Default is smaller.
+2. **How do you open a recording?** Default: a menu item **Recording > View a recording...** (Ctrl+O) in the Electron app, which opens a second window with the viewer, so a running Record in the first window is not disturbed. Optional extra if you want it: `pnpm view`, which opens only the viewer (one more line in `main.js` and one in `package.json`). Not in the default.
+3. **Time axis.** ECG and PCG run on separate clocks, 972 ppm apart on your recording, so with each trace on its own sample count they slide apart by about 0.6 s in 10 minutes. Default: both traces are placed on the host clock (`performance.now()` stamps stored in the file), each with one straight line, for display only. The viewer corrects nothing in the files and is not your piecewise drift fit. Alternative: nominal sample count for each trace (no correction, drifts).
+4. **Which ECG trace?** Default: the stored filtered lead II at 1000 Hz (kind 4), the same trace the recorder page draws, QRS about 10 ms late (forward-only filters). The raw 500 Hz counts (kind 2) are not shown. Say so if you want a switch for them.
+5. **May `Electron/main.js` get added lines?** It is the file that makes the second window, so the entry point needs it. Default: yes, additions only (about 10 lines: the menu and an `openViewer()` function), nothing existing changes, and a `diff` against a copy taken in V1 proves it. `Electron/` is untracked in git today, so git cannot show this diff and the copy does.
+6. **May `HOW_TO_RECORD.md` get a short "View a recording" section?** Default: yes, an addition at the end of the file. Dropped first if time is short.
+
+## What the recording holds (verified)
+
+| Item | Value |
+| --- | --- |
+| Folder | 399 files `00001.ecgpcg` to `00399.ecgpcg`, nothing else, no gaps in the numbering |
+| Total size | 104,566,282 bytes (`cat *.ecgpcg \| wc -c`), 104.6 MB |
+| File sizes | 262,144 to 262,264 bytes (256 KiB plus the record that crossed the limit), the last one 229,325 |
+| Length | 611.6 s of host time (10 min 12 s), so 171 KB/s. The guide says about 165 KB/s, so this is 4 % above. At 171 KB/s an hour is 615 MB, which matches the "about 600 MB per hour" |
+| Records | 6,804,547: kind 2 (ECG bytes) 6,444,873, kind 4 (filtered ECG) 298,878, kind 1 (PCG bytes) 60,783, kind 3 (events) 13 |
+| Payload bytes | kind 2 12.2 MB, kind 4 2.4 MB, kind 1 1.5 MB, events 0.8 KB: 16.1 MB in all. The other 88.5 MB (85 %) is the 13-byte record headers, because ECG chunks are tiny (median 2 bytes, 40-byte frames) |
+| `load_recording.py --json` | `errors` empty, `missing_segments` empty, `clean_stop` true, `pcg_frames` 60,999, `pcg_drops` 0, `ecg_frames` 305,047, `ecg_resyncs` 0, `ecg_1k_ok` true, `pcg_hz` 999.9994, `ecg_frame_hz` 500.4857, `relative_ppm` 972 (halves 964 and 985), 10 keep-alives, residual p99 about 4 ms and max about 66 ms on both streams |
+| Both signals present | yes, PCG and ECG, so both panels have data |
+
+**What follows from it (this is why the design is what it is):**
+
+- **Decoded, the whole recording is tiny.** PCG: 609,990 `int16` samples (1.2 MB). ECG: 610,093 `float32` samples from the kind 4 records (2.4 MB). 3.7 MB against 104.6 MB on disk, a factor of 28. An hour is about 21.6 MB decoded (3.6 M PCG samples at 2 bytes plus 3.6 M ECG samples at 4 bytes) against about 615 MB raw.
+- **So the viewer does not read segments on demand.** It streams the folder once, one 256 KB file at a time, keeps only the decoded samples and discards the raw bytes. Peak raw memory is one file. Reading on demand would need an index of 6.8 M records (41 M per hour) to save 21 MB. Not worth it. Upgrade only if hours-long recordings ever matter: a 10 h recording decodes to about 216 MB, still fine for a renderer 🔶.
+- **Reading cost, verified in Node:** walking all 6.8 M record headers, feeding the PCG chunks through `createParser` and copying the kind 4 payloads took 344 ms for the 10 min recording (the file reads were from cache). The same loop in the renderer should be in the same range 🔶. An hour is then roughly 2 to 5 s of CPU plus the disk read of 615 MB.
+- **Parser cross-check, verified:** `createParser` from `Web/pcg_parser.js`, run unchanged over the kind 1 chunks, returns 61,000 frames with 0 drops. Python's loader reports 60,999, because the loader removes the stale first frame ("the device queues one stale frame while the port is closed"). The viewer must drop that first frame too, and then both agree: 60,999 frames, 609,990 samples. The kind 4 payloads hold 610,093 samples = 2 x 305,047 - 1, equal to `len(ecg_1k)`.
+
+## Decisions
+
+- **Plain canvas, no dependency, no `pnpm add`.** Reason: two traces, min/max columns and a few lines of axis are about 100 lines, a chart library is more than that to learn and pin.
+- **Files:**
+  - `P/Web/viewer_data.js`: no DOM, so node can test it. `loadRecording(chunks)` takes an async iterable of `ArrayBuffer` (one per segment, in name order) and returns `{ pcg: Int16Array, ecg: Float32Array, pcgFit, ecgFit, events, segments, drops, errors }`. `columns(samples, fit, t0, t1, width)` returns, for each pixel column, the min and max of the samples whose time falls in that column.
+  - `P/Web/viewer.html`: the page, with its script inline (one module `<script>`): folder input, status line, two canvases, event handlers.
+  - `P/Tests/viewer_test.mjs`: one new self-check on synthetic data (see V2). Not an edit of `recorder_test.mjs`.
+  - `P/Electron/main.js`: added lines only, for the menu and the second window.
+- **Open a folder: `<input type="file" webkitdirectory>`**, the standard file input, not `showDirectoryPicker`. Reason: it works in Chrome and in Electron with no permission prompt and no dependence on what E4 finds out about `showDirectoryPicker` in Electron, and it lists 399 (or 2,400 for an hour) `File` objects that read lazily. The viewer keeps only `*.ecgpcg` whose stem is all digits, sorted by number, as `load_recording.py` does, and reports a missing number as an error line. No command-line argument in the default (see Not doing).
+- **Decoding, reusing what exists, unchanged:**
+  - **PCG:** push each kind 1 payload through `createParser` from `Web/pcg_parser.js` (imported by relative path, as `recorder.js` does), drop the first returned frame (stale), keep the rest as `Int16Array` in the order received. `parser.stats.drops` is shown.
+  - **ECG:** concatenate the kind 4 payloads as `Float32Array` (they are already lead II, filtered and upsampled to 1000 Hz, continuing across records). **`ecg_dsp.js` and `upsample.js` are not needed**: kind 2 is not parsed, so the filter is not run a second time and cannot disagree with what was recorded. A payload must be copied (`slice()`), because it starts at an offset that is not a multiple of 4.
+  - **Events (kind 3):** `JSON.parse` each, keep `start`, `stop`, `lost`, `read-error`, for the status line.
+  - **Damage rules, copied from the loader:** a record that overruns its file ends that file and adds a line to `errors`; a non-finite `t` skips the record; an unknown kind is an error line. The viewer never throws on a damaged recording.
+  - **One file at a time, with `await` between files**, so the page paints a progress line ("file 120 of 399") and stays alive.
+- **Time axis (default of Question 3):** `t0` = the `t` of the `start` event, else of the first record. Seconds on screen = `(t - t0) / 1000`. For each stream a least-squares line `t = a + b * index` through (index of the last sample of each chunk or record, its `t`), accumulated as running sums with the first values subtracted, so no per-chunk arrays are kept. The ECG pair is the last sample of each kind 4 record (the stamp is its kind 2 chunk's, same as the loader's `ecg_frame_t`). The PCG pair is the last sample of each `push` that returned frames.
+  - **Known limit 1, shortcut: `createParser` emits a frame when the next frame's header arrives, so the PCG stamps are up to one chunk (about 10 ms) later than the loader's `pcg_frame_t`, which uses the chunk with the frame's last byte.** The line absorbs it as a constant. Fine for looking, not for aligning to milliseconds: the exported files and the loader stay the way to do that, and the page's help line says so. Upgrade when someone must read S1 against QRS to a few ms in the viewer.
+  - **Known limit 2, shortcut: one straight line per stream over the whole recording.** Your own note says one line is not enough for offline correction. The two halves of the user's recording differ by 21 ppm, about 1.5 ms over 10 min, under one pixel. Upgrade to block-wise fits if a long recording shows the traces sliding.
+  - **Known limit 3, shortcut: after a dropped PCG frame the later PCG samples are drawn 10 ms early per drop** (the parser does not report where). The status line shows the drop count. The viewer does not parse kind 2, so it cannot count ECG resyncs either: `load_recording.py` reports them. Neither limit hits the user's recording (0 drops, 0 resyncs).
+  - **The status line also shows the two fitted rates and their difference in ppm**, which explains the drift on screen and can be compared with the loader (Acceptance V2).
+- **How it draws, and why nothing has to be on-demand:** the view is `[s0, s1]`. For each canvas and each pixel column, find the sample range by the inverse of the line, take the min and max of that range, and draw one vertical segment per column. A single-sample spike therefore always shows at any zoom. When there are fewer than about 2 samples per column (deep zoom), draw the samples as a polyline instead. The scan cost is the number of visible samples: 0.6 M per trace for the whole 10 min recording, about 3.6 M for an hour, a few ms to a few tens of ms per redraw 🔶. **No min/max pyramid** until an hour-long view feels slow (shortcut: scan, upgrade with a 1024-sample block pyramid).
+- **Zoom and pan:** wheel zooms about the cursor (x1.25 per step, same x range for both traces), drag pans, double-click shows the whole recording. The span is clamped between 0.1 s and the whole recording. Each trace autoscales its y to the visible min/max plus a 5 % margin (the ECG offset moves, so a fixed y would hide it). Time ticks at 1, 2 or 5 times a power of ten, labelled in seconds.
+- **Readout under the cursor:** `t = 123.456 s (02:03.4)`, and for each trace the sample index and value at that time, in counts as the loader has them (PCG x 3300/65536 is mV at PA6, written once in the help line). Nothing else is computed.
+- **Missing signal:** with no kind 4 samples (PCG-only recording) the ECG panel is hidden with a line saying so, and the same for PCG.
+- **Warnings shown in the status line, in words:** segment numbers missing, each `errors` line, PCG drops, no `stop` event ("not closed cleanly, the last 1.6 s or more may be lost"), `lost` and `read-error` events.
+- **Entry point in the app:** in `main.js`, after the existing code: append a **Recording** menu with **View a recording...** (Ctrl+O) to the application menu, which calls `openViewer()`: a new `BrowserWindow` (default `webPreferences`, so no preload, no Node) loading `http://127.0.0.1:8002/viewer.html`. 🔶 Whether `Menu.getApplicationMenu()` is already the default menu inside `whenReady` is not checked: if it is `null`, build the menu from the roles `fileMenu`, `editMenu`, `viewMenu`, `windowMenu` plus the new one, which is what the default holds. Acceptance in V4 checks that Reload and Developer Tools are still in the View menu. A second window does not make the app quit when it closes, and `window-all-closed` still quits the app when the last window goes.
+- **Security:** the viewer page has no network use and no Node. It reads only files the user picks. The server is the one from E2 (127.0.0.1, `Web/` only, traversal refused), which already serves any new file in `Web/`.
+- **Self-check:** one test file, synthetic data only (a recording of a person never goes into a test or fixture, the rule of `recorder_test.mjs`).
+
+## Steps
+
+**B, the "nothing that exists changed" check, run at the end of every step, all must pass:**
+- **B1:** `git status --porcelain` shows, under `P/Web`, `P/Tools`, `P/Tests`, `P/Src`, `P/Inc`, only `??` lines for the new files named in this plan (`Web/viewer.html`, `Web/viewer_data.js`, `Tests/viewer_test.mjs`), and `git diff --stat -- P/Web P/Tools P/Tests P/Src P/Inc` is empty. `HOW_TO_RECORD.md` appears as ` M` only after V5. `Electron/main.js` is untracked, so check it with `diff main.js.base Electron/main.js` where `main.js.base` is the copy saved in V1: every line of the diff starts with `>` (additions only).
+- **B2:** from `P`, `node --test Tests/recorder_test.mjs` shows `fail 0` and `pass 17`, the baseline.
+- **B3:** `python3 -m http.server -b 127.0.0.1 -d Web 8001` serves `curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8001/recorder.html` as 200, and `cmp` of the served `recorder.html` and `recorder.js` with the files is silent. Stop the server afterwards.
+- **B4:** (from V4 on) `pnpm start` in `P/Electron` still opens the recorder window with "Not recording." and the Mode, Signals, Window and Volume controls, and `curl -s http://127.0.0.1:8002/recorder.js | cmp - Web/recorder.js` is silent.
+- **B5:** the user's recording is untouched. Before V1 and after each step the tester runs `find <folder> -type f -printf '%p %s %T@\n' | sort | sha256sum` on the folder given at run time and the hash is the same. The folder path stays in the tester's shell, not in any file.
+
+- [x] **V1. Baseline and reference numbers.** Run B2 and note `pass 17`. Save `cp P/Electron/main.js <scratch dir outside the repo>/main.js.base`. Take the B5 hash. Run `python3 -I -B Tools/load_recording.py "<folder>" --json` and copy these into this step's tick line: `segments` 399, `pcg_frames` 60999, `pcg_drops` 0, `ecg_frames` 305047, `clean_stop` true, `errors` [], `pcg_hz`, `ecg_frame_hz`, `relative_ppm`, `seconds` 611.6. Note `git status --porcelain` (today: ` M PLAN.md` and the untracked `PCB_piezo-filter_v3.net`, `Posters/`, `logo_csc_fondo_oscuro_color.pdf`, `P/Electron/`). No repo file touched.
+  **Acceptance:** the reference numbers are written down and match the table above. B1 to B3, B5 pass.
+  **Done 2026-11-17 (executioner):** `recorder_test.mjs` pass 17, fail 0. B5 hash `816073d4...cca96` before and after V2. Loader: `segments` 399, `pcg_frames` 60999, `pcg_drops` 0, `ecg_frames` 305047, `clean_stop` true, `errors` [], `missing_segments` [], `pcg_hz` 999.99936, `ecg_frame_hz` 500.48565, `relative_ppm` 971.945, `seconds` 611.62. `main.js.base` saved in the session scratch dir. B1 to B3, B5 pass.
+- [x] **V2. Decoder and its self-check (`P/Web/viewer_data.js`, `P/Tests/viewer_test.mjs`).** `loadRecording` and `columns` as in Decisions. The test, synthetic only, builds segments with `record()` and `createLog` from `Web/recorder.js`: PCG frames (`[0x8000][seq][10 samples]` in odd-sized chunks, plus a stale first frame), kind 4 floats, events, one segment cut mid-record and one missing number. It asserts: sample counts (stale frame dropped), the fitted rate of a stream whose stamps run 1000 ppm fast within 5 ppm, `errors` lines for the cut segment and the gap, and that `columns` over 1 M samples with a single spike returns that spike as a column's max.
+  **Acceptance:** (a) `node --test Tests/viewer_test.mjs` shows `fail 0`. (b) Against the real recording, from node (a one-off command or throwaway script in the scratch dir that feeds `fs.readFile` buffers of the folder to `loadRecording`, nothing added to the repo): `pcg.length` 609,990, `ecg.length` 610,093, `segments` 399, `drops` 0, `errors` empty, a `stop` event present; fitted PCG rate within 50 ppm of the loader's `pcg_hz` (999.9994 Hz), fitted ECG rate within 50 ppm of 2 x `ecg_frame_hz` (1000.971 Hz), their difference within 30 ppm of the loader's `relative_ppm` (972); the whole load takes under 10 s. (c) Repeat (b) on a copy of the folder's first 40 files in a scratch directory: counts are smaller and the warnings say the recording was not closed cleanly. (d) Peak memory of (b) stays under 400 MB (`/usr/bin/time -v`), showing the raw bytes are not kept. B1 to B3, B5.
+  **Done 2026-11-17 (executioner):** `Web/viewer_data.js` (`segmentList`, `loadRecording`, `columns`, `timeAt`, `indexAt`) and `Tests/viewer_test.mjs` (3 tests, `fail 0`). Real recording from node: pcg 609,990, ecg 610,093, segments 399, drops 0, errors [], start and stop events present; fitted PCG 999.99937 Hz (0.01 ppm from the loader), ECG 1000.97118 Hz (-0.12 ppm from 2 x ecg_frame_hz), relative 971.8 ppm (loader 971.9); load 0.95 s, peak memory 78 MB; first 40 files: 61,270 PCG and 60,939 ECG samples, no stop event. `segmentList` (numbered files, gaps) is an addition to the plan's signature, because `loadRecording` sees only buffers. B1 to B3, B5 pass.
+- [x] **V3. The page (`P/Web/viewer.html`).** Folder input, progress line, status and warnings lines, two stacked canvases (ECG on top, PCG below), shared x, wheel zoom, drag pan, double-click reset, ticks, readout, hidden panel for a missing signal, a help line (counts, the 10 ms PCG limit, "for looking, not for aligning"). Try it in Chrome through the guide's server on 8001 (`python3 -m http.server -b 127.0.0.1 -d Web 8001`, then `http://127.0.0.1:8001/viewer.html`), where nothing of the app is involved.
+  **Acceptance (a person at the screen, 5 minutes, hardware-free):** choose the user's recording: the progress line runs and ends in under 15 s with the status line showing 399 files, 611.6 s, PCG 609,990 and ECG 610,093 samples, 0 drops, a clean stop, the two rates and about 972 ppm. Both traces fill the width over 0 to 611.6 s. Wheel-zoom to a 10 s span: repeating QRS complexes appear on the ECG panel and heart sounds on the PCG panel, and the same beats line up in time on the two (you judge this; if the beats do not repeat, the question is about the recording, not the viewer). Zoom to 0.1 s: samples show as a polyline. Drag pans both traces together. Double-click returns to the whole recording. The readout follows the cursor and shows time, index and value for both. Choosing a folder with no `.ecgpcg` files shows a line and no crash; choosing the first 40 files only shows "not closed cleanly". The recorder page in another tab of the same server still loads. B1 to B3, B5.
+  **Done 2026-11-17 (executioner):** `Web/viewer.html` (canvas, no dependency, `segmentList` errors appended to the result's errors). Tried in headless Chrome 150 on the 8001 server, driven over CDP: the folder went in through the real file input (`DOM.setFileInputFiles`), wheel, drag and double-click as real mouse events, screenshots read. User's recording: 399 files, 611.6 s start to stop (the samples cover 610.0 s), PCG 609,990, ECG 610,093, 0 drops, clean stop, PCG 999.9994 Hz, ECG 1000.9712 Hz, 972 ppm, read in 1.3 s. 7 s view: ECG QRS repeats about once a second with PCG bursts after each; 1.5 s and 0.1 s views draw the samples as a line; drag, reset and readout work. First 40 files: 61,270 PCG and 60,939 ECG samples, "not closed cleanly" warning. A folder with no `.ecgpcg`: "no segment files", no crash. Not checked: a real native folder dialog, keyboard zoom and pan, a PCG-only or ECG-only recording. The axis runs over the samples (610.0 s), the "611.6 s" is the start-to-stop time. B1 to B3, B5 pass (B4 starts at V4).
+- [x] **V4. Entry point in Electron (`P/Electron/main.js`, added lines only).** The **Recording > View a recording...** menu item, Ctrl+O, `openViewer()`.
+  **Acceptance:** `pnpm start` shows the recorder window as before (B4). **Recording > View a recording...** opens a second window with the viewer; the page works exactly as in V3 on the user's recording (the folder picker opens a native dialog and the numbers are the same). The **View** menu still has Reload and Toggle Developer Tools. Closing the viewer window leaves the recorder window open; closing both quits the app. Ctrl+O twice opens two viewer windows without error. `diff main.js.base Electron/main.js` has only `>` lines. No device is plugged in and the recorder window shows its usual "no device" state. If the native dialog does not offer the folder, the DevTools console says why, and the fallback is the same page served by the 8001 server in Chrome (V3), which already passes. B1 to B5.
+  **Done 2026-11-17 (executioner):** 9 lines added at the end of `Electron/main.js` (`Menu`/`MenuItem` import, `openViewer()` opening a 1400x900 `BrowserWindow` on `http://127.0.0.1:8002/viewer.html`, and a second `whenReady` that appends **Recording > View a recording...** (CmdOrCtrl+O) to the default application menu, which is not null there). `diff main.js.base main.js`: 0 `<` lines, 9 `>` lines. `pnpm start` with the remote-debugging and inspector ports (scratch only): the View menu still lists Reload, Force Reload and Toggle Developer Tools; the Recording menu is last. The menu item's own `click` was called from the main process twice: two viewer windows plus the recorder window, no error; the recorder window still says "Not recording." with Mode, Signals, Window, Volume; `curl 8002/recorder.js | cmp` silent. In one viewer window the user's recording went in through the real file input (DevTools): 399 files, 611.6 s, PCG 609,990, ECG 610,093, 0 drops, clean stop, 999.9994 / 1000.9712 Hz, 972 ppm, read in 0.9 s, 20 wheel steps give a 7.03 s view with QRS and PCG bursts repeating (screenshot read). Closing both viewers left the recorder open; closing it quit the app and nothing listens on 8002. B1 to B5 pass (recorder_test pass 17, viewer_test pass 3, B5 hash `816073d4...` unchanged). **Not checked, for the user (one click):** the native folder dialog (Choose File in the viewer window) and the real Ctrl+O keypress. The screen on :1 turned into a login screen during the run, so X input could not be used; the accelerator is declared in the menu (`CmdOrCtrl+O`) and its handler is the one called.
+- [x] **V5. Guide and final parity run.** Add a short "View a recording" section at the end of `HOW_TO_RECORD.md` (the one tracked existing file edited, an addition: menu path, Ctrl+O, what the two traces and the time axis mean, the 10 ms and drift limits in one line each, and that the recording folder is only read). Then run the checklist below.
+  **Acceptance:** the checklist is all pass. `git diff --stat` lists `HOW_TO_RECORD.md` and `PLAN.md` and nothing else; `git status --porcelain` adds only the new files of this plan and `P/Electron/` (already untracked). B1 to B5.
+  **Done 2026-11-17 (executioner):** section "5. View a recording" appended to `HOW_TO_RECORD.md` (8 lines added, 0 removed): `pnpm start`, Recording > View a recording..., Ctrl+O, pick your recording folder, the controls, the 10 ms PCG limit, "for looking, not for aligning". Non-GUI checks only, no X display touched: `git diff --stat` lists `HOW_TO_RECORD.md` and `PLAN.md` only; `git status --porcelain` adds only `Web/viewer.html`, `Web/viewer_data.js`, `Tests/viewer_test.mjs` and `P/Electron/`; `git diff --stat` on `P/Web P/Tools P/Tests P/Src P/Inc` empty; `diff main.js.base main.js` 0 `<` lines, 9 `>` lines; `recorder_test` pass 17 fail 0, `viewer_test` pass 3 fail 0; 8001 server: `recorder.html`, `recorder.js`, `viewer.html` return 200 and `cmp` is silent; B5 hash `816073d4...` unchanged; grep of the repo for the recording's folder name finds nothing. **Not checked, for the user:** the native folder dialog and the real Ctrl+O keypress in the Electron window.
+
+## Unchanged checklist for the tester
+
+| Feature | How the tester checks it | Pass |
+| --- | --- | --- |
+| Recorder page, helpers, `ecg.html`, `index.html`, firmware, loader | `git diff --stat -- P/Web P/Tools P/Src P/Inc P/Tests` | empty |
+| Existing tests | from `P`: `node --test Tests/recorder_test.mjs` | `fail 0`, `pass 17` |
+| New test | `node --test Tests/viewer_test.mjs` | `fail 0` |
+| Browser recorder | the guide's server on 8001, `recorder.html` loads, `cmp` with the files | 200, silent |
+| Electron recorder | `pnpm start` window, "Not recording.", controls, `recorder.js` over 8002 equals the file | yes |
+| Electron menus | View menu still has Reload and Developer Tools, Recording menu has the new item | yes |
+| `main.js` | `diff` against the V1 copy | only `>` lines |
+| User's recording | B5 hash before and after | equal |
+| Viewer numbers | status line against `load_recording.py --json`: 399 files, 609,990 PCG and 610,093 ECG samples, 0 drops, clean stop, rates within 50 ppm, 611.6 s | equal |
+| Viewer behaviour | V3 list: zoom, pan, reset, readout, warnings, empty folder | yes |
+| Loader still works | `python3 -I -B Tools/load_recording.py "<folder>"` summary identical to V1 (no `--export`: it would write beside the recording) | same |
+
+## If time is short
+
+| Keep | Drop |
+| --- | --- |
+| V1 baseline, V2 decoder with its test and the real-recording numbers, V3 page, V4 menu, every B | V5 `HOW_TO_RECORD.md` section (put the menu path in the tick line) |
+| Min/max columns, zoom, pan, readout, the status line numbers | The time ticks (keep the edge labels and the readout) |
+| The warnings for missing segments, errors, no stop | The y autoscale margin and the polyline at deep zoom (min/max columns alone still show every spike) |
+| The 0.1 s minimum span | V2 (c) and (d), the truncated-copy and memory checks |
+
+## Not doing
+
+- Raw ECG (kind 2) display, lead I, electrode-off flags, ECG resync counting: the loader has them.
+- PCG audio playback, filters, FFT, spectrogram, beat detection, heart-rate numbers, a second PCG view.
+- The drift correction itself, any change to timestamps, any export (the loader's `--export` stays the way), saving, screenshots, annotation, event markers on the plot.
+- Reading segments on demand, a min/max pyramid, a worker thread: not needed at 21.6 MB decoded per hour. Upgrade paths are named above.
+- A command-line argument or drag-and-drop for the folder (upgrade: the server could serve the folder read-only on a second path, with the same traversal check as E2). `pnpm view` unless Question 2 asks for it.
+- A chart library, any dependency, any `pnpm add`, TypeScript, a bundler.
+- Opening the viewer from the recorder page (would edit `recorder.html`, forbidden).
+- Comparing two recordings, several recordings open in one window, a recent-files list, remembering the last folder.
+- Hardware tests, packaging, Windows or macOS.
+
+## Needs the user
+
+- **Nothing physical.** No board, no cable, no sensor. Do not move or rename the recording, and keep it out of the repo.
+- **Answers to Questions 1 to 6**, or say "defaults". Questions 5 and 6 approve edits to two existing files, added lines only.
+- **About 5 minutes at the screen for V3 and V4**, because only you can say whether the beats line up and repeat. The tester can run everything else (counts, rates, memory, diffs) from a shell.
+- **Runtime only:** the tester is given the recording's folder path in the conversation, never in a file.
+- **Risks you should know:** (1) the viewer's PCG time is up to about 10 ms late against the loader's, and it uses one straight line per stream, so it is a viewer and not an alignment tool; (2) the Electron folder dialog for the viewer was not tried here 🔶, which is why V3 proves the page in Chrome first; (3) the 85 % header overhead means the "600 MB per hour" is mostly 13-byte headers around 2-byte ECG chunks, a format fact this plan does not change.
+
+---
+
+# PLAN: viewer ECG filtered offline (zero-phase)
+
+**Goal:** when the viewer opens a recording, build the ECG trace from the raw 500 Hz lead II in the file: filter it forward and backward (zero phase, like `scipy.signal.filtfilt`), then upsample it to 1000 Hz, so the QRS sits at its true time on the same axis as the PCG.
+
+**The user's request (2026-11-17), verbatim:** "then for me when I pressed the button to visualize recordings I want that you apply the filters to the raw 500 Hz ECG forward and backward (like scipy.signal.filtfilt), after filtered then upsample to 1000 Hz to show with PCG"
+
+**Hard constraint (user, 2026-11-17):** nothing that exists may change. Untouched: the browser recorder and every other `Web/` file (`ecg_dsp.js`, `upsample.js`, `recorder.js`, `pcg_parser.js` are imported as they are), `Tests/recorder_test.mjs` (17 pass), `Tools/`, firmware, `Electron/main.js`, the recordings. Only these change: `Web/viewer_data.js`, `Web/viewer.html`, `Tests/viewer_test.mjs` (all three are new, untracked files of the previous plan) and a short edit of section 5 of `HOW_TO_RECORD.md`. No dependency, pnpm only, never npm. **No hardware is needed or used: every check runs from a shell on files.** The recording's path is never written in the repo: the tester is given it at run time.
+
+`P` = `Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC`. **Verified** = measured on the user's 10-minute recording (305,047 ECG frames) with throwaway scripts kept outside the repo, nothing in the recording written. The prototype of the algorithm below exists only in the scratch directory; it is not the deliverable, the executioner writes the real code.
+
+## Questions for the user (none blocks the plan; the default is what gets built)
+
+1. **Which filters?** Default: the same four stages the recorder runs live (protocol `Biomedic_ECG_USB_protocol.md` section 12, 12.2), now zero phase: 0.25 Hz high-pass, 50 + 100 Hz notch, 0.75 Hz baseline high-pass, 40 Hz low-pass. Not the vendor's stage 0 (straight-line trend removal): the two high-passes remove the offset already, and filtfilt's start-up handling covers the rest.
+2. **The 40 Hz low-pass: once or forward and backward?** Default: **once, centred**, as the vendor program does (it is a symmetric FIR, so it is already linear phase). Forward and backward would square it: the -3 dB point drops from 39.6 Hz to 28.6 Hz, 50 Hz goes from -5 dB to -10 dB, and a 10 ms-wide QRS peak loses 9 % of its height instead of 5 %. It would be 6 lines less code (no centring). Say so if you want it "filtfilt on everything".
+3. **Upsampling.** Default: the recorder's own linear x2 (`createUpsampler(2)`), applied after the filters. It is zero phase, costs -0.14 dB at 40 Hz and -0.03 dB at 20 Hz, and the output has the same 2M - 1 layout as the stored trace. Nothing better is needed for display (a sinc would only change content above 250 Hz, which the filters already removed).
+4. **The stored forward-only trace (kind 4).** Default: it is used only when the recording holds no raw ECG frames, and the page then says so in its status line. No toggle. Say so if you want a switch to compare the two.
+5. **ECG sync losses (resyncs).** Default: each continuous run of frames is filtered on its own, the join is one empty sample, and the page lists "ECG lost sync N times". Your recordings have 0 resyncs, so this is for a damaged recording only.
+6. **Load time.** Reading raw ECG means parsing 6.4 M tiny records (median 2 bytes) with the unchanged `createParser`: **about 6 s for 10 minutes** (it was 1.3 s), about 35 s for an hour. The filter itself is 0.1 s. Default: accept it (the page shows "Reading file n of N"). Upgrade if you view hour-long recordings: join a file's ECG bytes before parsing and place the frames by byte count, as `load_recording.py` does.
+7. **May `HOW_TO_RECORD.md` section 5 get two changed lines?** Default: yes (what the ECG trace is now, and the load time). Dropped first if time is short.
+
+## What was found (verified unless marked)
+
+**The filters, exactly.** The recorder's live chain (`createEcgFilter` in `Web/ecg_dsp.js`) is, from zero state, forward only: subtract the first sample, then 0.25 Hz high-pass, 50/100 Hz notch, 12-tap 40 Hz FIR, 0.75 Hz baseline high-pass, all at 500 Hz, in doubles. Coefficients (`a[0] = 1`, protocol 12.2; the constants in `ecg_dsp.js` are not exported, so `viewer_data.js` carries its own copy, and test T1 below guards it):
+
+| Stage | b | a |
+| --- | --- | --- |
+| HP, Butterworth 2, 0.25 Hz | 0.997781024102941, -1.99556204820588, 0.997781024102941 | 1, -1.99555712434579, 0.995566972065975 |
+| NF, 50 + 100 Hz | 0.951558090821252, -2.1284207536999, 2.85527558178394, -2.1284207536999, 0.951558090821252 | 1, -2.18192506761969, 2.85407296314357, -2.07491643978012, 0.904318800282871 |
+| HF, Butterworth 4, 0.75 Hz | 0.987761389276826, -3.9510455571073, 5.92656833566095, -3.9510455571073, 0.987761389276826 | 1, -3.97537191256092, 5.92641855596542, -3.92671919775679, 0.975672562146085 |
+| MF, FIR 40 Hz, 12 taps | -0.00812031626499363, 0.00279430037155961, 0.0363062486230826, 0.0960723789024121, 0.163761187856556, 0.209186200511384, then the same six in reverse order (the `H40` of `ecg_dsp.js`, protocol 12.2) | 1 |
+
+**What forward and backward does to each stage** (magnitude measured with SciPy `freqz`, so squared means the response of one pass multiplied by itself, and the cutoff moves inwards):
+
+| Stage | One pass (the live chain) | Zero phase as planned | Why |
+| --- | --- | --- | --- |
+| HP 0.25 Hz | -3 dB at 0.250 Hz | forward + backward: -3 dB at **0.312 Hz** | IIR, squared |
+| NF | 50 Hz -35.2 dB, band -3 dB 48.0 to 52.0 Hz, 100 Hz -48.1 dB | forward + backward: **50 Hz -70.4 dB**, band 46.9 to 53.2 Hz, 100 Hz -96.1 dB | IIR, squared |
+| HF 0.75 Hz | -3 dB at 0.750 Hz, -14.3 dB at 0.5 Hz | forward + backward: -3 dB at **0.837 Hz**, -28.5 dB at 0.5 Hz | IIR, squared |
+| MF 40 Hz FIR | -3 dB at 39.6 Hz, 50 Hz -5.1 dB, delay 5.5 samples = 11 ms | **once, centred**: same response, delay removed | linear phase already; twice would give -3 dB at 28.6 Hz |
+
+Whole planned chain: -3 dB at **0.84 Hz and 38.3 Hz**, -0.04 dB at 5 Hz, -0.73 dB at 20 Hz, -1.7 dB at 30 Hz, 50 Hz about -76 dB. The live chain: 0.75 and 38.9 Hz. So the picture differs from the live one by phase (the 10 ms) and by a little more baseline and hum removal, not by any change of band. The 0.84 Hz is above the 0.67 Hz AHA figure (protocol 12.3, which is meant for zero-phase filters), so ST segments can still be flattened: for looking at rhythm and QRS, not ST analysis. Same as before, now stated for the new trace.
+
+**How the zero-phase IIR runs in JavaScript (the algorithm of `scipy.signal.filtfilt` defaults).** Per IIR stage, on a run of n frames in doubles:
+- `padlen = 3 * max(len(a), len(b))` = 9, 15, 15 for HP, NF, HF. A run of `padlen` frames or fewer is not filtered (SciPy raises): it becomes empty samples and is counted in the warning.
+- Odd extension on both ends: `2 * x[0] - x[padlen..1]` in front, `2 * x[n-1] - x[n-2..n-1-padlen]` behind.
+- Initial state: the filter's steady state for a constant input, which makes a recording that starts on an offset of -3000 counts start settled. Direct form II transposed, `z[k] = sum over j > k of (b[j] - a[j] * g)`, with `g = sum(b) / sum(a)`, times the first sample of the extended signal (4 lines, no matrix solve, equals `lfilter_zi`). Backward pass: reverse, filter again with the state scaled by the first sample of the reversed result, reverse back, cut the padding.
+- Direct form II transposed, the form SciPy's `lfilter` uses, so the two agree. The live chain uses direct form I; both are the same maths and double precision keeps them within about 1e-9 relative, but only the SciPy form was compared here.
+
+**FIR stage, centred exactly.** The 12 taps are symmetric, so a single causal pass delays by 5.5 samples (11 ms at 500 Hz). That is a whole number of samples at 1000 Hz, so the delay is removed after the upsample, not before, with no half-sample error (the vendor re-centres by 6 samples and is 1 ms off, protocol 12.1): extend the last IIR output by 6 copies of its last sample and the first by 11 copies of its first (SciPy `nearest`, as protocol 12.2), run the causal FIR over M + 6 outputs, upsample those with `createUpsampler(2)`, and drop the first 11 output samples. The result has 2M - 1 samples and sample 2m is frame m. The FIR runs last (the live chain has it before HF): the stages are linear and time invariant, so the order changes only the ends, and last keeps the made-up end samples out of the HF stage.
+
+**Prototype result on the user's recording (verified).** Stages HP, NF, HF each forward and backward, FIR once centred, linear x2, 610,093 samples:
+- **Against SciPy** (`filtfilt` x3, `lfilter` for the FIR, same extension and shift, run on the loader's `ecg_ii`): maximum difference **4.0e-6 counts** on a signal whose maximum is 84 counts, which is float32 rounding of the output (84 x 6e-8). So the algorithm is the same as SciPy's, edges included.
+- **No phase shift:** the cross-correlation of raw (baseline-removed) and filtered over 120 s peaks at **lag 0 samples** at 1000 Hz. 670 QRS complexes found (median RR 910 ms); raw peak minus filtered peak: median +1 ms, 10th to 90th percentile +1 to +3 ms (the raw is sampled every 2 ms, so a peak is only found to about 2 ms). The stored forward-only trace is the control: correlation lag 9 ms, peaks median 11 ms late.
+- **Baseline wander and hum** (Welch power, raw against filtered): 0 to 0.8 Hz **-33 dB**, 49 to 51 Hz **-27 dB**, 99 to 101 Hz **-60 dB**, QRS band 5 to 30 Hz only -0.5 dB. Standard deviation 733 counts raw (offset about -3156, wander range -4317 to -1115) against 11 counts filtered, mean -0.01. First and last second of the output: largest value 60 and 54 counts against 70 for 99.9 % of the body, so the ends are not worse than the middle.
+- **Time and memory:** the whole chain (3 zero-phase IIR stages, FIR, upsample) for 305,047 frames (610 s) **80 ms**, for 1,830,282 frames (one hour, the recording repeated 6 times) **380 ms**; node peak 148 MB for the hour including the 15 MB input and the 88 MB base of node, i.e. about 60 MB above the base. In the page, working buffers are doubles of the run length (15 MB per hour each, a handful alive at once), the output is float32: 2.4 MB per 10 minutes, 14.6 MB per hour, the same as the stored trace. The raw lead II is kept as `Int16Array` (0.6 MB per 10 minutes, 3.7 MB per hour) until the filter has run.
+
+**How raw ECG is decoded today, and how it is reused unchanged.**
+- Kind 2 records are the module's bytes as received, cut anywhere (median 2 bytes). `createParser` from `Web/ecg_dsp.js` is the only decoder: the page pushes every kind 2 payload into one parser, in file order, and takes `II` (the second number of each returned `[I, II]`, a big-endian int16). `Tools/load_recording.py` has the same rules (`ecg_frames`) and `Web/recorder.js` feeds the same parser live.
+- **Verified:** over the user's recording that parser returns **305,047 frames, lead II equal to the loader's `ecg_ii` on every frame**, 86 bytes skipped (all before the first frame), 0 resyncs, at most 33 frames out of one chunk. And the live chain (`createEcgFilter` + `createUpsampler(2)` as imported) run over those decoded counts gives **the stored kind 4 trace bit for bit: 0 of 610,093 samples differ.** So the decode is proven correct without any change to the recorder.
+- `viewer_data.js` today imports only `pcg_parser.js` and says `ecg_dsp.js` is not needed. That comment goes: it now imports `createParser` from `./ecg_dsp.js` and `createUpsampler` from `./upsample.js` (served by the Electron server and by the guide's server: both serve all of `Web/`). `ecg_dsp.js` has no side effects on import.
+- **Resync detection, using only the parser's `stats`:** after the parser has locked (frames before the push > 0), a push that raises `stats.skipped` marks a resync. The run is cut before the first frame that push completes, or, if it completes none, before the first frame of the next push that does. *shortcut: the parser does not say where in a chunk the skip happened, so the cut can be a few frames (one chunk) early; upgrade only if a recording with resyncs ever matters.* Start-up junk before the first frame is not a resync.
+
+**Time axis carry-over.** The ECG fit is the same least-squares line as now, in the 1000 Hz index space: after each kind 2 push that completes frames, add the pair (index `2 * (frames so far - 1)`, `t` of that record). That is exactly the pair the stored trace gives today (the last sample of a kind 4 record is the sample at frame `m`, index `2m`, with the kind 2 chunk's stamp), so **the fit, the 1000.97 Hz and the 972 ppm on the status line must come out the same as now** (check Z2). With joins, each run contributes 2n - 1 samples and one empty sample, so index `2m` stays frame `m` for every run. The PCG, `timeAt`, `indexAt`, `columns` and the drawing code do not change. *shortcut: after a resync with lost bytes the ECG after it is drawn early by the lost time, as the PCG is after a drop; the warning says so.*
+
+## Decisions
+
+- **Everything new goes in `viewer_data.js`**, no new file: `loadRecording` gets a kind 2 branch (parse, keep lead II, fit, cuts); a small zero-phase function (about 25 lines: coefficients, `lfilter`, steady state, `filtfilt`, the FIR step) runs once after the last file, over each run; the result is returned as `ecg` and `ecgFit`, plus `ecgSource` (`'raw'` or `'stored'`), `ecgResyncs` (frame numbers of the cuts) and `ecgShort` (runs not filtered). Kind 4 stays collected as today (2.4 MB) and is returned as `ecg` only when no raw frame was decoded. The old results keep their names and meaning, so `viewer.html` changes only in texts and warnings.
+- **No dependency, no matrix solve, no worker.** One pass over 0.6 M samples takes 0.1 s: a worker would cost more code than it saves.
+- **Doubles for the filter, float32 for the result**, as the stored trace.
+- **`viewer.html`:** the ECG title says "ECG lead II (LL - RA), zero-phase filtered"; the stale caption sentence "the stored lead II with the forward-only filters ... QRS about 10 ms late" is replaced by "ECG: the raw 500 Hz lead II filtered forward and backward offline (0.25 Hz high-pass, 50/100 Hz notch, 0.75 Hz baseline, 40 Hz low-pass; no delay, but ST segments are flattened), then upsampled to 1000 Hz by linear interpolation. Counts as recorded"; the status line adds "ECG: raw, zero phase" or "ECG: stored forward-only trace, about 10 ms late (no raw ECG in this recording)"; warnings for resyncs and for runs too short to filter. The PCG sentence stays.
+- **Check of an assumption, not a decision:** the 1.6 s end-of-recording loss and the PCG limits in the caption are unchanged.
+
+## Steps
+
+**B, the "nothing that exists changed" check, run at the end of every step, all must pass:**
+- **B1:** `git status --porcelain` shows, under `P/Web`, `P/Tools`, `P/Tests`, `P/Src`, `P/Inc`, only the `??` lines of today (`Web/viewer.html`, `Web/viewer_data.js`, `Tests/viewer_test.mjs`, `Electron/`) and ` M HOW_TO_RECORD.md`, ` M PLAN.md`; `git diff --stat -- P/Web P/Tools P/Tests P/Src P/Inc` is empty; and the hash of everything else untracked is unchanged from Z1: `cd P && find Electron -path Electron/node_modules -prune -o -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum` (`Electron/main.js` included), plus `sha256sum Web/ecg_dsp.js Web/upsample.js Web/recorder.js Web/pcg_parser.js Tools/load_recording.py Tests/recorder_test.mjs`.
+- **B2:** from `P`, `node --test Tests/recorder_test.mjs` shows `fail 0` and `pass 17`.
+- **B3:** `python3 -m http.server -b 127.0.0.1 -d Web 8001` serves `recorder.html` as 200 and `cmp` of the served `recorder.js`, `ecg_dsp.js`, `upsample.js` with the files is silent. Stop the server afterwards.
+- **B4:** (from Z5) `pnpm start` in `P/Electron` still opens the recorder window with "Not recording.", and `curl -s http://127.0.0.1:8002/ecg_dsp.js | cmp - Web/ecg_dsp.js` is silent.
+- **B5:** the recording is untouched: `find <folder> -type f -printf '%p %s %T@\n' | sort | sha256sum` is the same before Z1 and after every step.
+
+- [x] **Z1. Baseline and the SciPy reference (no repo file touched).** Run B1 (take the hashes), B2, `node --test Tests/viewer_test.mjs` (`pass 3`), B5. In the scratch directory write the reference: load the user's recording with `Tools/load_recording.py` (imported, read-only, never `--export`), take `ecg_ii` as float64, run `scipy.signal.filtfilt` with the three IIR pairs above in the order HP, NF, HF, then the FIR as `lfilter` over the output extended by 11 copies of its first and 6 of its last sample, linear x2, drop the first 11, and save it as `.npy` (610,093 samples). Also save `ecg_ii` and the stored `ecg_1k`. `python3 -I -B -c "import scipy"` already works here (NumPy 1.26.4, SciPy 1.11.4): nothing to install.
+  **Acceptance:** the reference exists, its length is 2 x 305,047 - 1, B1 to B3 and B5 pass with the hashes written down.
+  Done 2026-11-17: B1 hashes taken (in scratch), recorder 17 pass, viewer 3 pass, B3 and B5 ok; SciPy reference in scratch, 610,093 samples = 2 x 305,047 - 1.
+- [x] **Z2. Decode the raw ECG (`P/Web/viewer_data.js` only).** The kind 2 branch, the fit pair, the resync cuts, `ecgSource`; the filter is not written yet (`ecg` = the stored trace, as now, plus a new field with the raw lead II as `Int16Array`). Update the stale import comment. 
+  **Acceptance:** (a) `node --test Tests/viewer_test.mjs` still shows `pass 3` with its assertions unchanged (the synthetic recording holds 40 zero bytes as its "raw" record and kind 4 floats, so this is also the fallback test). (b) From node on the real recording (a throwaway script in the scratch directory that feeds the folder's files to `loadRecording`): raw lead II 305,047 samples, **identical to the loader's `ecg_ii`** (compare the saved array), `ecgResyncs` empty, `errors` empty, and the fitted ECG rate equals the one from the stored trace within 1e-6 Hz (1000.9712 Hz) with the same relative ppm (972). (c) Load time reported: expect about 6 s, fail above 15 s. B1 to B3, B5.
+  Done 2026-11-17: raw lead II 305,047 frames equal to the loader's `ecg_ii` on every frame, 0 resyncs, no errors; ECG fit identical to the stored-trace fit (1000.9711811 Hz, 972 ppm); load 8 to 10 s here (plan expected about 6, limit 15); viewer 3 pass; B ok.
+- [x] **Z3. The zero-phase filter and upsample (`P/Web/viewer_data.js` only).** As in "What was found": the three IIR stages forward and backward, the FIR once, `createUpsampler(2)`, drop 11, runs cut at resyncs joined by one NaN each, `ecg` = the result when raw frames exist.
+  **Acceptance (real recording, scratch scripts):** (a) **against the Z1 reference: maximum absolute difference at most 1e-5 counts over all 610,093 samples** (prototype: 4.0e-6, float32 rounding), and no NaN. (b) **No phase shift:** cross-correlation of raw (500 Hz series minus its 0.6 s median, linearly upsampled) and the new `ecg` over a 120 s piece peaks at lag 0 samples, plus or minus 1; the QRS peaks of the new trace against the raw ones have a median offset within +/-2 ms, and the stored trace as a positive control comes out at 9 to 11 ms. (c) **Wander and hum:** Welch power at 0 to 0.8 Hz down by at least 25 dB, at 49 to 51 Hz by at least 20 dB, and 5 to 30 Hz within 1 dB of raw (prototype: -33, -27, -0.5 dB). (d) First and last second not larger than 1.5 times the 99.9th percentile of the rest. (e) Time for the filter chain under 1 s for 610 s (prototype 0.08 s) and, on the recording repeated 6 times in memory, under 5 s and under 300 MB extra (prototype 0.38 s, 60 MB). B1 to B3, B5.
+  Done 2026-11-17: max difference against the SciPy reference 4.0e-6 counts, no NaN; xcorr lag 0 samples, QRS median offset +1 ms (stored trace +11 ms); wander -33 dB, hum -27 dB, 5 to 30 Hz -0.5 dB; first and last second 60 and 54 against 70; chain 0.07 s for 610 s, 0.48 s and about 108 MB extra for 1 hour; B ok.
+- [x] **Z4. The self-check (`P/Tests/viewer_test.mjs`, synthetic data only, a recording of a person never goes into a test).** Add a helper that makes 40-byte ECG frames (`01 C0`, `02 C0`, `03 C0` markers, lead II as big-endian int16 at byte 8) and three tests; the three existing ones stay as they are.
+  - **T1, against SciPy:** a recording whose lead II is a formula (a 1.3 Hz wave, a 12 Hz wave, a 50 Hz wave and a ramp, 400 frames, in chunks of odd sizes with `createLog`). The expected values are about 12 numbers from SciPy (output samples 0 to 3, a few in the middle, and the last 4, so the start, the end, the centring and the shift are all hit), written into the test with a comment holding the SciPy call that made them. Assert agreement within 1e-3 (float32 and the numbers' digits), `ecg.length` 799, `ecgSource` `'raw'`, and the fitted rate within 5 ppm of the stamps. This also fails if a coefficient was copied wrong.
+  - **T2, zero phase:** a symmetric triangle pulse at frame 300 of 600: the output's largest absolute value is at index 600, and `out[600 - d]` equals `out[600 + d]` within 1e-4 for d up to 40.
+  - **T3, resync:** the same frames with 7 junk bytes inserted in the middle: one entry in `ecgResyncs`, one NaN at the join, length 2M - 1 where M counts only the frames, and each run equal, sample for sample, to the same run loaded alone.
+  **Acceptance:** `node --test Tests/viewer_test.mjs` shows `pass 6`, `fail 0`, in a few seconds. Mutation check, then undo: change one digit of one coefficient, or the shift 11 to 10, and T1 and T2 fail. B1 to B3, B5.
+  Done 2026-11-17: `pass 6`, `fail 0` in 1.8 s; mutation (one coefficient digit, shift 11 to 10) fails T1 and T2, undone. T2 tolerance is 0.01 counts on 2000 frames, not 1e-4 on 600: filtfilt's start-up differs slightly between the two ends (SciPy does the same), 0.19 counts at 600 frames.
+- [x] **Z5. The page (`P/Web/viewer.html`).** The texts, status line and warnings from Decisions; nothing in the drawing code. Try it in headless Chrome on the guide's server on 8001, driven over CDP as in V3 (the folder through the real file input, screenshots read).
+  **Acceptance:** on the user's recording the status line still reads 399 files, 611.6 s, PCG 609,990 and ECG 610,093 samples, 0 drops, clean stop, the same two rates and 972 ppm, plus "ECG: raw, zero phase"; the whole load ends under 15 s. A 7 s view shows QRS complexes with the baseline flat and no 50 Hz fuzz; wheel-zoomed to 0.1 s the QRS peak sits where the same peak sits in the raw, read off the readout (within 2 ms). The first 40 files (no stop event) still load with the warning. A folder holding only kind 4 records (made in scratch by dropping kind 2 records) shows "stored forward-only trace" and still draws. The old caption sentence is gone. B1 to B5.
+  Done 2026-11-17: headless Chrome over CDP on 8001, folder through the real file input: status line 399 files, 611.6 s, PCG 609,990 and ECG 610,093 samples, 0 drops, clean stop, 999.9994 and 1000.9712 Hz, 972 ppm, "ECG: raw, zero phase."; load 8 to 10 s; console empty. 7 s view: baseline flat, no 50 Hz fuzz, 8 QRS complexes with PCG bursts after each; at 0.1 s the filtered QRS peak is 3 and 1 ms before the raw peak on two beats (raw is sampled every 2 ms). First 40 files: "not closed cleanly" warning. Folder with kind 2 dropped: "stored forward-only trace" status and title, still draws. Progress line "Reading file n of N, then filtering the ECG". B1 to B3 and B5 ok; B4 not run (it opens an Electron window on the user's screen), `Electron/` hash equal to Z1 instead.
+- [x] **Z6. Guide and final parity.** In `HOW_TO_RECORD.md` section 5, change the first bullet to say the ECG is the raw 500 Hz lead II filtered forward and backward on the computer (QRS on time, ST segments flattened), shown at 1000 Hz, and add the load time (about 6 s per 10 minutes). The "10 ms late" sentence in that section is about PCG and stays. Run `grep -n "forward-only\|10 ms late" HOW_TO_RECORD.md` and read each hit.
+  **Acceptance:** the checklist below is all pass, and `git diff --stat` lists `HOW_TO_RECORD.md` and `PLAN.md` only.
+  Done 2026-11-17: `HOW_TO_RECORD.md` section 5 first bullet now says the ECG is the raw lead II filtered forward and backward on the computer, QRS on time, ST flattened, shown at 1000 Hz, and gives the load time as about 10 s per 10 minutes (measured 8 to 10 s here, not the plan's 6 s). The "10 ms late" sentence is about PCG and stays; the grep finds only it. Checklist all pass; `git diff --stat` lists `HOW_TO_RECORD.md` and `PLAN.md` only.
+
+## Unchanged checklist for the tester
+
+| Feature | How the tester checks it | Pass |
+| --- | --- | --- |
+| Recorder, helpers, loader, firmware | `git diff --stat -- P/Web P/Tools P/Src P/Inc P/Tests` | empty |
+| Imported files as they are | the `sha256sum` list of B1 against Z1 | equal |
+| `Electron/main.js` and the rest of `Electron/` | the `find ... sha256sum` of B1 | equal |
+| Existing tests | from `P`: `node --test Tests/recorder_test.mjs` | `fail 0`, `pass 17` |
+| Viewer tests | `node --test Tests/viewer_test.mjs` | `pass 6`, `fail 0` |
+| Browser recorder | the 8001 server, `recorder.html` 200, `cmp` of the four js files | silent |
+| Electron recorder | `pnpm start`, "Not recording.", `ecg_dsp.js` over 8002 equals the file | yes |
+| The recording | B5 hash before and after | equal |
+| Viewer numbers | status line against Z1: 399 files, 609,990 and 610,093 samples, 0 drops, 972 ppm | equal |
+| Loader | `python3 -I -B Tools/load_recording.py "<folder>"` summary equal to Z1 (no `--export`) | same |
+
+## If time is short
+
+| Keep | Drop |
+| --- | --- |
+| Z1, Z2, Z3 with acceptance (a) and (b), Z4 T1 and T2, Z5, every B | Z6 (put the sentence in the tick line) |
+| The SciPy comparison and the zero-phase check | Z3 (c) to (e), the hour-long run |
+| One run for the whole recording plus a warning "ECG lost sync N times" | Cutting runs at resyncs and the NaN join (and T3) |
+
+## Not doing
+
+- A toggle or a second trace for the stored forward-only ECG (Question 4), lead I, electrode flags, QRS detection, heart rate, ST analysis.
+- The vendor's stage 0 (trend removal), its 16-bit rounding between stages, its block margins; the 25 Hz FIR and the 60 Hz notch (not implemented by the vendor either); the second FIR-only chain (protocol 12.4).
+- Any change to the recorder, the file format, the loader, the export, the filter on the live page, or `ecg_dsp.js` (its constants stay private, so the viewer holds a copy that T1 guards).
+- A better upsampler, a worker thread, parsing by file (upgrade named in Question 6), a pyramid, a stored result, saving the filtered trace.
+- Correcting clock drift, or the PCG's 10 ms and the unmeasured +/-3 ms ECG to PCG path offset (the caption keeps saying "for looking, not for aligning").
+- Hardware tests of any kind.
+
+## Needs the user
+
+- **Nothing physical.** No board, no cable, no sensor. Do not move or rename the recording.
+- **Answers to Questions 1 to 7**, or say "defaults". Nothing to install: NumPy 1.26.4 and SciPy 1.11.4 are already in `python3`, so the SciPy comparison runs here. Question 7 approves a two-line edit of an existing tracked file.
+- **About 3 minutes at the screen after Z5:** only you can say whether the QRS now sits where you expect against the heart sounds (the check against the raw trace is numbers, and the PCG path offset is not measured).
+- **Runtime only:** the tester is given the recording's folder path in the conversation, never in a file. Scratch scripts and arrays of the recording stay in the scratch directory and are deleted at the end.
+- **Risks you should know:** (1) the page now takes about 6 s to open a 10-minute recording and about 35 s for an hour (Question 6); (2) zero phase with 0.84 Hz and 40 Hz limits flattens ST segments and smooths T waves in a different way than the forward-only trace did, so this is still for rhythm and QRS; (3) with a damaged recording the cut at a resync can be a few frames early, and the ECG after lost bytes is drawn early by the time lost; (4) the prototype numbers above come from one recording of 305,047 frames, so Z3 repeats them on the recording the tester is given.
+
+# RESEARCH: aligning ECG and PCG
+
+**Question (user, 2026-11-17):** "now I want you to research how can I alineate both signals". Research only: nothing is built, no repo file except this section changed, no hardware used. Scripts and arrays of the recording were in the scratch directory and are deleted. The recording's path is never written here: it is "the user's recording" (10.2 min, 305,047 ECG frames, 609,990 PCG samples, 0 drops, 0 resyncs). "Measured" = computed here, read-only, on that one recording. "Estimate" = reasoning or literature, not tried here.
+
+## Where the timestamps come from (read from the code)
+
+- **PCG:** the STM32 counts frames (`seq`, 10 samples each, one frame per 10 ms DMA half), so the sample index is exact and has no jitter. The only time stamp is the host's `performance.now()` when a USB chunk is read. Chunks are one 24-byte frame each (60,500 of 60,999 chunks).
+- **ECG:** frames have no counter at all. Sample m is just "the m-th frame since the last resync". The stamp is the host time of the chunk that held the frame's last byte. The MCP2200 hands over 1 to 2 bytes at a time (6.4 million chunks in 10 min), so the stamp is within about 1 ms of the last byte arriving.
+- **One clock:** both streams are stamped by the same `performance.now()` call in the recorder, resolution 100 microseconds (Chrome without cross-origin isolation, 5 microseconds with it, MDN). The recording's stamps do step by 0.1 ms.
+- **Everything that is not a stamp is unknown:** the time between the physical event and the stamp (ECG module's own filtering and buffering, UART 1.74 ms per 40-byte frame at 230400 baud, USB; PCG analog filter on the user's PCB, ADC, board filter, USB). That is the "path offset", estimated at +-3 ms and never measured.
+
+## What causes the misalignment today, ranked by size (measured unless marked)
+
+| # | Cause | Size on the user's recording | Who removes it today |
+|---|---|---|---|
+| 1 | **ECG module clock runs fast against PCG** | ECG 500.486 Hz (nominal 500), PCG 999.9994 Hz: **972 ppm**, 0.97 ms per second, 58 ms per minute, **0.58 s at the end**, more than half a cardiac cycle (RR median 908 ms). PCG is 0.6 ppm from the host clock | The viewer and the loader place both streams on the host clock. Counting samples alone would be useless |
+| 2 | **PCG board band-pass is causal** (20-200 Hz, 4th-order Butterworth pairs, `pcg_filter.c`) | Group delay 31 ms at 20 Hz, 14 at 30, 8 at 40, 5.7 at 50, 4.6 at 60, 3.2 ms at 100-200 Hz (recomputed here). The S1 and S2 energy at 30-60 Hz is late by about 5 to 14 ms, frequency dependent. Running the recorded PCG through the inverse phase offline moved the largest lobe of the averaged S1 from R+31 ms to R+8 ms | **Nobody.** The ECG side is zero phase in the viewer, so the PCG alone is late |
+| 3 | **Unmeasured path offset, ECG chain against PCG chain** | Estimated +-3 ms. The data cannot confirm it (next section) | Nobody, and no software can |
+| 4 | **Viewer only: PCG stamped one frame late** | Exactly **+10.000 ms** on this recording (per frame 9.1 to 10.9 ms), because `createParser` emits a frame when the next header arrives. Fit intercepts differ by 10.00 ms, slopes by 0.00007 ppm. The loader does not have it | The viewer's help line says so. In the viewer every R to S1 delay reads 10 ms longer than from the loader |
+| 5 | **ECG clock is not a straight line against the host** | After one straight line the ECG's 30 s block medians run from **-2.4 to +1.2 ms** (3.6 ms peak to peak, smooth curve: -2.4 at the start, +1.2 near 390 s, -2.0 at the end). PCG stays within +-0.05 ms. Halves of the recording differ by 21 ppm (loader). The viewer uses one line per stream | Not in the viewer. Your piecewise fit removes it |
+| 6 | **Stamp jitter** | Random, mostly harmless to a fit: per frame 5th to 95th percentile spread 1.0 to 1.5 ms (ECG) and 0.6 to 1.3 ms (PCG) inside a 30 s block, p99 4.2 ms, max 66 ms on both streams at the same moment (one host stall). A fit over thousands of frames leaves about 0.1 ms (estimate) | The fit |
+| 7 | **Resolution of the events themselves** | ECG R peak: 2 ms samples (parabolic interpolation gives better). PCG: 1 ms samples | Interpolation |
+
+Independent check that cause 5 is real and not a stamping artefact: I detected 670 R peaks (zero-phase 5-25 Hz, 66 bpm), took the shape of the first 120 ms of PCG after each (template match per beat), and followed it in 60 s blocks. With the single line, the block medians of the S1 position move **-3.3 to +1.5 ms**; with the piecewise map they stay within **-1.4 to +1.3 ms**. The first set correlates with the timestamp-based ECG wander at **r = -0.88** (sign flipped because it is a lag), similar amplitude. Two unrelated measurements agree on the shape of the wander, to about 1 ms.
+
+## What the recording says about R to S1 (and why it cannot be used as the offset)
+
+- **Per beat, the S1 pattern's position against R has a spread of 3.2 ms (standard deviation)** with the piecewise map (3.8 ms with one line). That includes R detection (about +-1 ms), the stamp noise and the real beat-to-beat variation. It is the size of what you can see: clock errors of 0.2 to 0.5 ms are well under it.
+- **Where S1 sits:** averaged over 669 beats, the raw PCG leaves zero at about R-14 ms (small), the first big burst starts at **R+8 to R+10 ms** (loader convention, so R+18 to R+20 ms in the viewer), with lobes at about R+16, R+30 and R+50 ms. The S2 envelope peak is at R+374 ms (IQR 367 to 382).
+- **Literature:** S1 starts 10 to 50 ms after the R peak and lasts 100 to 160 ms, S2 starts 280 to 360 ms after R (Ahlstrom 2006, quoted by Bao 2020). R to mitral closure on the seismocardiogram is 41 +-9 ms (2025 conference paper, snippet only). Q onset to the mitral component of S1 (EMAT) is 80 +-8 ms under 30 years, 82 +-11 at 30 to 39 (Dillier 2011), which is roughly R+50 to R+60 ms if Q onset to the R peak is 20 to 30 ms (my arithmetic).
+- **Reading:** your first burst is at the early edge of the 10 to 50 ms range, and early against EMAT. That could mean the ECG chain is later than the PCG chain by tens of ms, or that the first burst is a QRS-locked electrical component in the piezo chain (high-impedance sensor with cable), or simply a different auscultation site. **This recording cannot tell which.** Bao 2020 found that the S1 onset moves with the sensor site, after R at the aortic site and before R at the mitral site, so the R to S1 delay is not a constant of the heart.
+- **So aligning "on" the electromechanical delay removes the quantity you may want to measure.** Any rule like "shift PCG until S1 is 50 ms after R" fixes the answer in advance. Use it only to check drift (it is independent of the clocks), never to set the constant.
+- **Mains hum is not a common reference** (the earlier plan hoped it might be). Raw ECG has a clean 60.00 Hz line (46 times the local spectrum median), 120 Hz (103 times) and 180 Hz (27 times). The PCG has no narrow line above 8 times the local median anywhere in 30 to 250 Hz. The ECG line at exactly 60.00 Hz when its rate is taken as 500.486 Hz is only a weak check of the rate (mains is good to about 800 ppm).
+
+## Options, from cheapest to most accurate
+
+| # | Option | Needs | Effort | Accuracy (clock and constant) | Risk |
+|---|---|---|---|---|---|
+| 1 | **Host-clock map per stream: PCG one line, ECG piecewise** (30 to 60 s blocks, median of the residual from one line, interpolated), both onto one 1 kHz timeline. This is what `timestamps.npz` is for | Software only, offline, about 30 lines of NumPy. It is the open piecewise trial | 1 hour | Clock part about 0.2 ms random (measured block-to-block agreement within 1 ms with option 3). Constant offset still unknown, +-3 ms estimate | Per-block latency changes (USB, CPU load) look like clock wander. The jitter test above says they are small here |
+| 2 | **Undo the PCG board filter delay offline** (multiply the PCG spectrum by the inverse phase of the 48 kHz biquads; 10 lines, scipy `sosfreqz` has the response) | Software only | 1 hour | Removes the known 5 to 14 ms at S1 frequencies. The magnitude stays as recorded, and the result is non-causal: it spreads about 20 ms before a transient, so onsets look early | Easy to over-read the pre-ringing as "S1 before R". Use it for lobe and envelope timing, not onsets |
+| 3 | **Feature check per minute: R train against the PCG envelope** (Shannon energy `-x^2 log x^2` of a 25-150 Hz zero-phase PCG, or Hilbert magnitude, averaged on R) | Software only | 2 hours | Per 60 s block about 0.4 ms (3.2 ms / sqrt(65 beats)). Tracks drift and wander independently of the stamps. **Cannot give the constant**, because the constant and the heart's own delay are the same number here | Needs clean beats and a stable sensor site. If S1 is weak in a stretch, the block is useless |
+| 4 | **A tap or knock as marker** (hit the bandage or chest once at start and end) | Nothing but the user's hand | minutes | Poor: the ECG sees it only as electrode motion, and published tap-based alignment reports 17 ms (a 2026 thesis, abstract only). The piezo must not be moved, and a knock above it is close to moving it | Cannot be trusted below about 10 ms. Not recommended |
+| 5 | **One-time bench pulse into both chains** (the same step from a battery, a resistive divider and a switch, into the ECG module's RA and LL inputs and into the PCG filter PCB's input). Gives the constant path offset to about 0.5 ms | One wire and a short bench session. The offset is a property of the two paths, not of the patient, so no body is connected, and it stays valid until the setup changes (cable, PC, USB port, firmware) | half a day | Sub-ms for the constant if the same feature is compared in both. The PCG chain's 20-200 Hz band-pass smears an edge, so use a short burst or compare matching features, and subtract option 2's delay | The piezo wire has to be unplugged at the PCB for the test (the piezo itself stays under the bandage). A signal into PA6 beyond 0 to 3.3 V would hurt the chip: the divider and the battery decide that. **Hardware, so not today** |
+| 6 | **One clock for both**: sample the ECG in the STM32 ADC too (the board has other ADC pins), or a STM32 GPIO pulse into the ECG module | Hardware: an ECG analog front end that is not the Biomedic module, and a body connection to a mains PC through USB (isolation unknown, the user has been informed) | days | 0.1 ms or better. The Biomedic module is a closed box with no counter and no sync input, so there is no firmware route on the ECG side | Out of proportion for a research viewer. Not recommended |
+
+NTP-style ping from the STM32 (the earlier option D) would only improve the PCG-to-host offset to about 0.5 ms. The ECG side stays unknown, so it does not change the answer.
+
+## Typical accuracies in the literature
+
+- **Schmidt 2016 (CinC paper):** two recorders of the same lead II, linear alignment was not enough (drifting or suddenly changing rates). Cross-correlation in a running 4 s window, smoothed derivative of the delays used to resample locally. Afterwards R peaks differ by **0.3 +-4.5 ms** (15 recordings, 5000 Hz against 500 Hz Holter). They had the same signal in both systems, which is the thing you do not have.
+- **LSL (Kothe 2025, Imaging Neuroscience):** NTP-style offset exchange, post hoc linear regression of timestamps, sub-millisecond jitter (about 0.5 ms SD) on a laptop. But the per-setup constant offsets, 6.3 and 12.2 ms against a reference pulse, are not seen by the software and have to be measured with a physical pulse. Same lesson as option 5. The paper also lists offset spreads of 145 and 156 ms that contradict its own claims (probably unit errors, not resolved).
+- **Event markers (Spilz and Munz 2021, arXiv preprint):** a magnetic event gives IMUs a maximum offset below 2.6 ms at 100 Hz.
+- **Wearable drift (Gilbert ISWC 2022, abstract only):** 40 to 60 ppm and offsets of tens to hundreds of ms before sync.
+- **Datasets:** EPHNOGRAM (Kazemnejad 2021, bioRxiv preprint, PhysioNet) samples ECG and PCG in one microcontroller at 8 kHz, so it needs no alignment, and it gives no residual skew. Its front ends differ (ECG 150 Hz, PCG 1 kHz low-pass) and it only says the group delays are "rather constant". The PhysioNet/CinC 2016 page says some recordings have a simultaneous ECG but gives no alignment statement. In the Springer HSMM segmenter the ECG is used only to label training data (R peak, end of T), never at test time.
+
+## Recommendation for this user (own research tool, small scope, no hardware today)
+
+1. **Do option 1 and say that the constant stays unknown.** It removes about 3.6 ms of ECG wander (cause 5) and costs nothing but the script you already started. Use the loader's `pcg_frame_t` and `ecg_frame_t`, not the viewer's stamps, so cause 4 never enters.
+2. **Add option 2 only if you quote S1 or S2 positions in ms.** It is the largest known error left (5 to 14 ms) and it needs no hardware.
+3. **Use option 3 as a check, not as a calibration.** If its per-minute lag moves by more than about 1 ms after option 1, the map is wrong. Never set the constant from it.
+4. **For beat-to-beat variation and for differences between conditions, this is already enough:** the constant cancels, and 0.2 to 0.5 ms of clock error is under a 3.2 ms physiological spread. **For an absolute R to S1 or EMAT in ms you need option 5**, once, later, and until then quote it as "R to S1 = x ms with an unmeasured offset of about +-3 ms or more".
+5. **The viewer stays as it is** ("for looking, not for aligning"). Putting a piecewise fit or the 10 ms correction into it is more code for a use you do offline.
+
+**If you only do one thing:** fit the ECG time stamps piecewise (30 to 60 s blocks) instead of with one straight line, and put both signals on the host clock from the loader's stamps. Drift is 972 ppm and its curvature alone is 3.6 ms, both far above the stamp noise.
+
+## Not doing
+
+Any build in this step, a sync-marker firmware, STM32 echo pings, a second ADC channel for ECG, Lab Streaming Layer or any other dependency (the recorder already does what it does: host stamps and post hoc regression), automatic alignment in the viewer, a model-based delay learner, S1/S2 segmentation for a whole pipeline, a tap protocol.
+
+## Questions for the user
+
+1. **What is the alignment for?** Default: beat-to-beat timing and changes between conditions (software only is enough). If the answer is an absolute R to S1 or EMAT in ms, option 5 (one bench session) is the only way to get below about 3 ms with any confidence.
+2. **Where is the piezo on the chest** (apex, left sternal border, base)? Default: unknown, so no literature delay is used as a reference. It changes where S1 should sit against R (Bao 2020).
+3. **Should I write the alignment script?** Default: no, you do it, and I only review it. If yes: `Tools/` in the PCG_CDC folder, NumPy and SciPy only, offline, options 1 and 2, with one self-check on a synthetic drift.
+4. **Allow option 5 later?** Default: not today. It needs the piezo wire unplugged at the PCB once, a battery and a divider, and nothing connected to a body.
+5. **Is a QRS-locked electrical component in the PCG channel acceptable to investigate?** Default: no. It would show whether a free marker exists in every beat, but telling electrical from mechanical needs a test with the piezo off the chest, which is hardware.
+
+## Sources
+
+Papers and standards-grade: Schmidt et al., "Temporal Alignment of Asynchronously Sampled Biomedical Signals", Computing in Cardiology 2016, https://cinc.org/archives/2016/pdf/014-311.pdf (read in full). Kothe et al., "The lab streaming layer for synchronized multimodal recording", Imaging Neuroscience 2025, https://pmc.ncbi.nlm.nih.gov/articles/PMC12434378/ (read 100,000 of 111,359 characters). Dillier et al., "Assessment of Systolic and Diastolic Function in Asymptomatic Subjects Using Ambulatory Monitoring With Acoustic Cardiography", Clin Cardiol 2011;34(6):384-388, https://pmc.ncbi.nlm.nih.gov/articles/PMC6652310/ (read). Bao, Deng, Gall, Kamavuako, "Analysis of ECG and PCG Time Delay around Auscultation Sites", BIOSIGNALS 2020 (conference), https://www.scitepress.org/Papers/2020/89426/89426.pdf (read; Ahlstrom 2006 is quoted from here, not opened).
+
+Preprints, theses, conference snippets: Kazemnejad, Gordany, Sameni, EPHNOGRAM, bioRxiv 2021, https://www.biorxiv.org/content/10.1101/2021.05.17.444563v2.full (preprint; dataset https://physionet.org/content/ephnogram/). Spilz and Munz, magnetometer-based IMU synchronisation, arXiv 2107.03147 (abstract only). R to MC 41 +-9 ms: IEEE SPMB 2025 paper, https://isip.piconepress.com/conferences/ieee_spmb/2025/papers/08_spmb_p01_03.pdf (search snippet only). Tap-marker thesis, TU Wien 2026, https://repositum.tuwien.at/bitstream/20.500.12708/226907/1/Kuegler%20Christoff%20-%202026%20-%20Accuracy%20of%20Marker%20Actions%20for%20the%20Offline..pdf (thesis, snippet only). Gilbert ISWC 2022, https://antoniahamilton.com/Gilbert_ISWC_2022.pdf (snippet only).
+
+Documentation: MDN `Performance.now()`, https://developer.mozilla.org/en-US/docs/Web/API/Performance/now (read). PhysioNet/CinC 2016 challenge page, https://physionet.org/content/challenge-2016/1.0.0/ (read: no alignment statement). PhysioNet HSS segmenter, https://physionet.org/content/hss/ (snippet only). No blog post was relied on. Shannon energy as `-x^2 log x^2` and the Hilbert comparison (Tseng 2012, Biomed Eng Online 11:8) come from search snippets only; the Springer page would not open.
+
+## Could not verify
+
+- The ECG-to-PCG constant path offset: nothing here measures it, and the recording cannot (it is confounded with the heart's delay and the sensor site).
+- Whether the first PCG burst at R+8 to R+10 ms is mechanical or QRS electrical coupling.
+- The module's internal delay and the MCP2200's USB latency timer. Chunk sizes suggest it is low, not proved.
+- Chrome's actual timer resolution in the Electron app (MDN says 100 microseconds without cross-origin isolation; the 0.1 ms steps in the file agree).
+- All numbers come from one 10-minute recording of one session. Whether the ECG wander (3.6 ms) and the 972 ppm repeat in other recordings: the earlier recordings in this plan gave -514, -184 and +972 ppm, so the rate changes in size and sign between sessions, and each recording needs its own fit.
+- Springer pages (Tseng 2012, the Nearest Advocate EURASIP paper) did not open; the snippets were not relied on for numbers.

@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ECG and PCG recording viewer</title>
+<style>
+  :root {
+    --page: #f5f5f7; --card: #fff; --text: #1d1d1f; --secondary: #6e6e73; --hairline: rgba(0, 0, 0, .08);
+    --accent: #0a70ec; --ring: rgba(10, 112, 236, .8); --warn: #b3261e; --warn-tint: #fdecea;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text); -webkit-font-smoothing: antialiased;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Segoe UI", system-ui, sans-serif;
+  }
+  header { position: sticky; top: 0; z-index: 1; border-bottom: 1px solid var(--hairline); background: rgba(255, 255, 255, .72); backdrop-filter: saturate(180%) blur(20px); }
+  .bar, main { max-width: 1280px; margin: 0 auto; padding-inline: 28px; }
+  .bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 24px; padding-block: 12px; }
+  h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: -.02em; }
+  label { font-size: 13px; font-weight: 500; color: var(--secondary); }
+  input:focus-visible, canvas:focus-visible { outline: 3px solid var(--ring); outline-offset: 2px; }
+  main { padding-block: 16px 28px; }
+  main p { margin: 0 0 4px; font-size: 13px; color: var(--secondary); }
+  main p:empty { margin: 0; } /* not display: none, which takes a live region out of the accessibility tree */
+  #msg { color: var(--text); }
+  #warn { color: var(--warn); font-weight: 600; white-space: pre-line; }
+  #warn:not(:empty) { margin-block: 8px; padding: 8px 16px; border-radius: 14px; background: var(--warn-tint); }
+  #readout { font-variant-numeric: tabular-nums; min-height: 2.9em; }
+  figure { margin: 12px 0 0; }
+  .card { padding: 14px 18px 16px; border-radius: 18px; background: var(--card); box-shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 8px 24px rgba(0, 0, 0, .05); }
+  .card + .card { margin-top: 16px; }
+  h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
+  .plot { position: relative; }
+  canvas { display: block; width: 100%; height: calc(50vh - 190px); min-height: 160px; touch-action: none; cursor: crosshair; }
+  .cur { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(0, 0, 0, .35); pointer-events: none; }
+  [hidden] { display: none; }
+  figcaption { margin-top: 16px; padding-inline: 4px; font-size: 12px; color: var(--secondary); }
+</style>
+</head>
+<body>
+<header>
+  <div class="bar">
+    <h1>ECG and PCG recording viewer</h1>
+    <label>Recording folder <input id="pick" type="file" webkitdirectory></label>
+  </div>
+</header>
+<main>
+<p id="msg" role="status">Choose the folder of a recording. It is only read.</p>
+<p id="stats" role="status"></p>
+<p id="warn" role="status"></p>
+<p id="readout"></p>
+<figure>
+  <div class="card" id="cardEcg" hidden>
+    <h2 id="ecgTitle">ECG lead II (LL − RA), zero-phase filtered</h2>
+    <div class="plot"><canvas id="traceEcg" tabindex="0" role="img" aria-label="ECG lead II of the recording. Wheel or plus and minus zoom, drag or arrow keys pan, double-click or Home shows all."></canvas><i class="cur" hidden></i></div>
+  </div>
+  <div class="card" id="cardPcg" hidden>
+    <h2>PCG</h2>
+    <div class="plot"><canvas id="tracePcg" tabindex="0" role="img" aria-label="PCG of the recording. Wheel or plus and minus zoom, drag or arrow keys pan, double-click or Home shows all."></canvas><i class="cur" hidden></i></div>
+  </div>
+  <figcaption>Wheel (or + and −) zooms about the pointer, drag (or the arrow keys) pans both traces together, double-click (or Home) shows it all.
+    ECG: the raw 500 Hz lead II filtered forward and backward offline (0.25 Hz high-pass, 50/100 Hz notch, 0.75 Hz baseline, 40 Hz low-pass; no delay, but ST segments are flattened), then upsampled to 1000 Hz by linear interpolation. Counts as recorded. PCG: counts, ×3300/65536 for mV at PA6.
+    Each trace is placed on the computer clock with one straight line, for display only: the PCG time can be up to about 10 ms late, and a dropped PCG frame shifts the PCG after it by 10 ms.
+    This is for looking, not for aligning: use the exported files for that.</figcaption>
+</figure>
+</main>
+<script type="module">
+import { segmentList, loadRecording, columns, timeAt, indexAt } from './viewer_data.js';
+
+const MIN_SPAN = 100; // ms
+const $ = (id) => document.getElementById(id);
+const traces = [
+  { key: 'ecg', name: 'ECG', card: $('cardEcg'), canvas: $('traceEcg'), color: '#0a70ec', unit: '' },
+  { key: 'pcg', name: 'PCG', card: $('cardPcg'), canvas: $('tracePcg'), color: '#2e7d32', unit: ' counts' },
+];
+let rec = null, whole = null, view = null;
+
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const secs = (t) => (t - rec.t0) / 1000;
+const mmss = (s) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`;
+
+$('pick').onchange = async (e) => {
+  const files = [...e.target.files], list = segmentList(files.map((f) => f.name));
+  rec = null;
+  for (const tr of traces) tr.card.hidden = true;
+  for (const id of ['stats', 'warn', 'readout']) $(id).textContent = '';
+  async function* read() {
+    for (const [n, i] of list.order.entries()) {
+      $('msg').textContent = `Reading file ${n + 1} of ${list.order.length}, then filtering the ECG`;
+      yield await files[i].arrayBuffer();
+    }
+  }
+  const start = performance.now();
+  try {
+    rec = await loadRecording(read());
+  } catch (err) {
+    $('msg').textContent = `Could not read the folder: ${err.message}`;
+    return;
+  }
+  rec.errors = [...list.errors, ...rec.errors];
+  for (const tr of traces) {
+    tr.data = rec[tr.key];
+    tr.fit = rec[`${tr.key}Fit`];
+    tr.card.hidden = !(tr.fit && tr.data.length);
+  }
+  $('ecgTitle').textContent = `ECG lead II (LL − RA), ${rec.ecgSource === 'raw' ? 'zero-phase filtered' : 'stored forward-only trace'}`;
+  const shown = traces.filter((tr) => !tr.card.hidden);
+  const warns = [...rec.errors];
+  if (rec.segments && !rec.events.some((ev) => ev.e === 'stop')) warns.push('The recording was not closed cleanly (no stop event): the last 1.6 s or more may be lost.');
+  if (rec.drops) warns.push(`${rec.drops} PCG frames were dropped: the PCG after each is drawn 10 ms early.`);
+  if (rec.ecgResyncs.length) warns.push(`ECG lost sync ${rec.ecgResyncs.length} times: each stretch is filtered on its own, and the ECG after lost bytes is drawn early by the time lost.`);
+  if (rec.ecgShort) warns.push(`${rec.ecgShort} ECG stretches were too short to filter and are left empty.`);
+  for (const ev of rec.events) if (ev.e === 'lost' || ev.e === 'read-error') warns.push(`${ev.e} on ${ev.stream} at ${secs(ev.t).toFixed(1)} s: ${ev.message}`);
+  for (const tr of traces) if (tr.card.hidden) warns.push(`No ${tr.name} samples in this recording.`);
+  $('warn').textContent = warns.join('\n');
+  if (!shown.length) {
+    $('msg').textContent = 'Nothing to show.';
+    return;
+  }
+  whole = { lo: Math.min(...shown.map((tr) => timeAt(tr.fit, 0))), hi: Math.max(...shown.map((tr) => timeAt(tr.fit, tr.data.length - 1))) };
+  const [p, q] = [rec.pcgFit, rec.ecgFit];
+  const stop = rec.events.find((ev) => ev.e === 'stop'); // the samples end up to 1.6 s before the stop, which is what the loader counts
+  $('msg').textContent = `${rec.segments} files, ${((stop ? stop.t - rec.t0 : whole.hi - whole.lo) / 1000).toFixed(1)} s from start to ${stop ? 'stop' : 'the last sample'}, `
+    + `${stop ? `samples cover ${((whole.hi - whole.lo) / 1000).toFixed(1)} s, ` : ''}read in ${((performance.now() - start) / 1000).toFixed(1)} s.`;
+  $('stats').textContent = `PCG ${rec.pcg.length.toLocaleString()} samples, ECG ${rec.ecg.length.toLocaleString()} samples, ${rec.drops} PCG drops, `
+    + `${rec.events.some((ev) => ev.e === 'stop') ? 'clean stop' : 'no stop'}`
+    + (p && q ? `, PCG ${p.hz.toFixed(4)} Hz, ECG ${q.hz.toFixed(4)} Hz, ${((q.hz / p.hz - 1) * 1e6).toFixed(0)} ppm apart.` : '.')
+    + (rec.ecgSource === 'raw' ? ' ECG: raw, zero phase.' : rec.ecg.length ? ' ECG: stored forward-only trace, about 10 ms late (no raw ECG in this recording).' : '');
+  setView(whole.lo, whole.hi - whole.lo);
+};
+
+function setView(a, span) {
+  const full = whole.hi - whole.lo;
+  span = clamp(span, Math.min(MIN_SPAN, full), full);
+  a = clamp(a, whole.lo, whole.hi - span);
+  view = { a, b: a + span };
+  draw();
+}
+
+function draw() {
+  const dpr = devicePixelRatio, span = view.b - view.a;
+  for (const tr of traces) {
+    if (tr.card.hidden) continue;
+    const c = tr.canvas, w = Math.round(c.clientWidth * dpr), h = Math.round(c.clientHeight * dpr);
+    if (c.width !== w || c.height !== h) [c.width, c.height] = [w, h];
+    const g = c.getContext('2d'), { min, max } = columns(tr.data, tr.fit, view.a, view.b, w);
+    let lo = Infinity, hi = -Infinity;
+    for (let x = 0; x < w; x++) {
+      if (min[x] < lo) lo = min[x];
+      if (max[x] > hi) hi = max[x];
+    }
+    if (!(hi >= lo)) [lo, hi] = [-1, 1];
+    if (hi === lo) [lo, hi] = [lo - 1, hi + 1];
+    const m = 0.05 * (hi - lo), top = hi + m, bot = lo - m;
+    const y = (v) => ((top - v) / (top - bot)) * h;
+    g.clearRect(0, 0, w, h);
+    g.font = `${11 * dpr}px system-ui, sans-serif`;
+    g.fillStyle = g.strokeStyle = '#6e6e73';
+    g.lineWidth = 1;
+    const raw = span / 1000 / Math.max(2, c.clientWidth / 110), mag = 10 ** Math.floor(Math.log10(raw));
+    const step = [1, 2, 5, 10].find((k) => k * mag >= raw) * mag, digits = Math.max(0, -Math.floor(Math.log10(step)));
+    g.globalAlpha = 0.25;
+    g.beginPath();
+    for (let s = Math.ceil(secs(view.a) / step) * step; s <= secs(view.b); s += step) {
+      const x = Math.round(((s * 1000 + rec.t0 - view.a) / span) * w) + 0.5;
+      g.moveTo(x, 0), g.lineTo(x, h);
+    }
+    g.stroke();
+    g.globalAlpha = 1;
+    for (let s = Math.ceil(secs(view.a) / step) * step; s <= secs(view.b); s += step) g.fillText(`${s.toFixed(digits)} s`, ((s * 1000 + rec.t0 - view.a) / span) * w + 3 * dpr, h - 4 * dpr);
+    g.fillText(hi.toFixed(0), 3 * dpr, 12 * dpr);
+    g.fillText(lo.toFixed(0), 3 * dpr, h - 16 * dpr);
+    g.strokeStyle = tr.color;
+    g.lineWidth = dpr;
+    g.beginPath();
+    if (span / tr.fit.b / w < 2) { // under 2 samples per column: the samples themselves
+      const i0 = Math.max(0, Math.floor(indexAt(tr.fit, view.a)));
+      for (let i = i0; i <= Math.min(tr.data.length - 1, Math.ceil(indexAt(tr.fit, view.b))); i++) {
+        const x = ((timeAt(tr.fit, i) - view.a) / span) * w;
+        if (i === i0) g.moveTo(x, y(tr.data[i])); else g.lineTo(x, y(tr.data[i]));
+      }
+    } else {
+      for (let x = 0; x < w; x++) if (!Number.isNaN(min[x])) g.moveTo(x + 0.5, y(max[x]) - 0.5), g.lineTo(x + 0.5, y(min[x]) + 0.5);
+    }
+    g.stroke();
+  }
+}
+
+function readout(e) {
+  const r = e.currentTarget.getBoundingClientRect(), t = view.a + ((e.clientX - r.left) / r.width) * (view.b - view.a), s = secs(t);
+  for (const cur of document.querySelectorAll('.cur')) [cur.hidden, cur.style.left] = [false, `${e.clientX - r.left}px`];
+  const at = (tr) => {
+    const i = Math.round(indexAt(tr.fit, t));
+    return tr.card.hidden ? '' : ` | ${tr.name} #${i} = ${i >= 0 && i < tr.data.length ? tr.data[i].toFixed(tr.key === 'pcg' ? 0 : 2) + tr.unit : 'none'}`;
+  };
+  $('readout').textContent = `t = ${s.toFixed(3)} s${s >= 0 ? ` (${mmss(s)})` : ''}${traces.map(at).join('')} | view ${((view.b - view.a) / 1000).toFixed(2)} s`;
+}
+
+for (const { canvas } of traces) {
+  let drag = null;
+  canvas.addEventListener('wheel', (e) => {
+    if (!rec) return;
+    e.preventDefault();
+    const r = canvas.getBoundingClientRect(), f = (e.clientX - r.left) / r.width, span = view.b - view.a;
+    const next = clamp(span * (e.deltaY < 0 ? 0.8 : 1.25), Math.min(MIN_SPAN, whole.hi - whole.lo), whole.hi - whole.lo);
+    setView(view.a + f * (span - next), next);
+    readout(e);
+  }, { passive: false });
+  canvas.addEventListener('pointerdown', (e) => {
+    if (!rec) return;
+    canvas.setPointerCapture(e.pointerId);
+    drag = { x: e.clientX, a: view.a };
+  });
+  canvas.addEventListener('pointermove', (e) => {
+    if (!rec) return;
+    if (drag) setView(drag.a - ((e.clientX - drag.x) / canvas.clientWidth) * (view.b - view.a), view.b - view.a);
+    readout(e);
+  });
+  canvas.addEventListener('pointerup', () => { drag = null; });
+  canvas.addEventListener('pointerleave', () => { for (const cur of document.querySelectorAll('.cur')) cur.hidden = true; });
+  canvas.addEventListener('dblclick', (e) => {
+    if (!rec || !whole) return;
+    setView(whole.lo, whole.hi - whole.lo);
+    readout(e);
+  });
+  canvas.addEventListener('keydown', (e) => {
+    if (!rec || !whole) return;
+    const span = view.b - view.a, mid = view.a + span / 2;
+    if (e.key === '+' || e.key === '=') setView(mid - span * 0.4, span * 0.8);
+    else if (e.key === '-') setView(mid - span * 0.625, span * 1.25);
+    else if (e.key === 'ArrowLeft') setView(view.a - span * 0.1, span);
+    else if (e.key === 'ArrowRight') setView(view.a + span * 0.1, span);
+    else if (e.key === 'Home') setView(whole.lo, whole.hi - whole.lo);
+    else return;
+    e.preventDefault();
+  });
+}
+window.addEventListener('resize', () => whole && draw());
+</script>
+</body>
+</html>

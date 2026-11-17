@@ -52,3 +52,11 @@ ECG and PCG run on separate clocks, so correct the drift offline with a piecewis
 - **The page crashed:** the files saved so far are kept, about 1.6 s is lost, and the next Start works normally.
 
 More detail is in `Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/README.md` and `Acquisition_systems_summary.md`.
+
+## 5. View a recording
+
+From `Projects/WeAct_MiniH750/Applications/USB_Device/PCG_CDC/Electron`, run `pnpm start`. Choose **Recording > View a recording...** (Ctrl+O) and pick your recording folder. A second window opens, so a running Record is not disturbed. No board is needed, and the folder is only read.
+
+- ECG (lead II) is on top and PCG below, on one time axis in seconds from the start. The ECG is the raw 500 Hz lead II filtered forward and backward on the computer (QRS on time, ST segments flattened), shown at 1000 Hz. Opening takes about 10 s per 10 minutes of recording.
+- The mouse wheel zooms about the cursor, dragging pans, and a double-click shows the whole recording. The readout under the plots gives the time and the value of each trace at the cursor.
+- The PCG time can be up to about 10 ms late, and each trace is placed with one straight line, so this is for looking, not for aligning. Use the loader and the export in section 4 for that.
