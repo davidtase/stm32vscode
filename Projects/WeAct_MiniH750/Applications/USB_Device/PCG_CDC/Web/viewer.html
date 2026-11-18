@@ -27,14 +27,28 @@
   #warn { color: var(--warn); font-weight: 600; white-space: pre-line; }
   #warn:not(:empty) { margin-block: 8px; padding: 8px 16px; border-radius: 14px; background: var(--warn-tint); }
   #readout { font-variant-numeric: tabular-nums; min-height: 2.9em; }
+  #selinfo, #note { min-height: 1.45em; } /* so the traces do not jump when a label is selected or a note appears */
   figure { margin: 12px 0 0; }
   .card { padding: 14px 18px 16px; border-radius: 18px; background: var(--card); box-shadow: 0 1px 2px rgba(0, 0, 0, .04), 0 8px 24px rgba(0, 0, 0, .05); }
   .card + .card { margin-top: 16px; }
   h2 { margin: 0 0 8px; font-size: 13px; font-weight: 600; }
   .plot { position: relative; }
-  canvas { display: block; width: 100%; height: calc(50vh - 190px); min-height: 160px; touch-action: none; cursor: crosshair; }
+  canvas { display: block; width: 100%; height: calc(50vh - 250px); min-height: 160px; touch-action: none; cursor: crosshair; }
   .cur { position: absolute; top: 0; bottom: 0; width: 1px; background: rgba(0, 0, 0, .35); pointer-events: none; }
   [hidden] { display: none; }
+  .tools { margin-top: 12px; }
+  .tools .row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin: 8px 0; }
+  .tools .row div { display: flex; flex-wrap: wrap; gap: 6px; }
+  #counter { font-size: 15px; font-weight: 600; color: var(--text); }
+  button { padding: 5px 12px; border: 1px solid var(--hairline); border-radius: 10px; background: var(--card); color: var(--text); font: inherit; font-size: 13px; cursor: pointer; }
+  button:disabled { color: var(--secondary); cursor: default; }
+  button:focus-visible { outline: 3px solid var(--ring); outline-offset: 2px; }
+  #mark[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .kind { padding: 3px 10px; border-radius: 10px; }
+  .kind:has(input:checked) { color: var(--text); font-weight: 700; }
+  #kindRlabel:has(input:checked) { background: rgba(10, 112, 236, .16); }
+  #kindTlabel:has(input:checked) { background: rgba(46, 125, 50, .18); }
+  .proposed { color: #e07b00; } .confirmed { color: #1b8a3a; } .edited { color: #1f5fd6; } .added { color: #8e24aa; }
   figcaption { margin-top: 16px; padding-inline: 4px; font-size: 12px; color: var(--secondary); }
 </style>
 </head>
@@ -50,6 +64,38 @@
 <p id="stats" role="status"></p>
 <p id="warn" role="status"></p>
 <p id="readout"></p>
+<section class="tools" id="tools" hidden>
+  <div class="row">
+    <button type="button" id="mark" data-act="m" aria-pressed="false">Mark mode: off (m)</button>
+    <div role="radiogroup" aria-label="Marks to correct in mark mode (keys r and t)">
+      <label class="kind" id="kindRlabel"><input type="radio" name="kind" id="kindR" checked> R (r)</label>
+      <label class="kind" id="kindTlabel"><input type="radio" name="kind" id="kindT"> T (t)</label>
+    </div>
+  </div>
+  <p id="mouse"></p>
+  <p id="counter" role="status"></p>
+  <p id="selinfo" role="status"></p>
+  <p id="note" role="status"></p>
+  <div class="row">
+    <div role="group" aria-label="Review">
+      <button type="button" data-act="p">Previous beat (p)</button>
+      <button type="button" data-act="n">Next beat (n)</button>
+      <button type="button" data-act="u">Next unreviewed (u)</button>
+      <button type="button" data-act="f">Next flagged (f)</button>
+      <button type="button" data-act="enter">Confirm and go on (Enter)</button>
+      <button type="button" data-act="del">Delete label (Delete)</button>
+    </div>
+    <div role="group" aria-label="History and file">
+      <button type="button" id="undo" data-act="undo">Undo (Ctrl+Z)</button>
+      <button type="button" id="redo" data-act="redo">Redo (Ctrl+Y)</button>
+      <button type="button" data-act="again">Propose again</button>
+      <button type="button" data-act="save">Save labels</button>
+    </div>
+    <label>Load labels <input id="loadFile" type="file" accept=".csv,text/csv"></label>
+    <label><input id="trace05" type="checkbox"> Show the 0.5 Hz labeling trace (the one the detectors use)</label>
+  </div>
+  <p>Labels: <b class="proposed">orange dashed = proposed</b>, <b class="confirmed">green = confirmed</b>, <b class="edited">blue = edited</b>, <b class="added">purple = added</b>; ? marks a beat to look at first.</p>
+</section>
 <figure>
   <div class="card" id="cardEcg" hidden>
     <h2 id="ecgTitle">ECG lead II (LL − RA), zero-phase filtered</h2>
@@ -61,12 +107,19 @@
   </div>
   <figcaption>Wheel (or + and −) zooms about the pointer, drag (or the arrow keys) pans both traces together, double-click (or Home) shows it all.
     ECG: the raw 500 Hz lead II filtered forward and backward offline (0.25 Hz high-pass, 50/100 Hz notch, 0.75 Hz baseline, 40 Hz low-pass; no delay, but ST segments are flattened), then upsampled to 1000 Hz by linear interpolation. Counts as recorded. PCG: counts, ×3300/65536 for mV at PA6.
-    Each trace is placed on the computer clock with one straight line, for display only: the PCG time can be up to about 10 ms late, and a dropped PCG frame shifts the PCG after it by 10 ms.
-    This is for looking, not for aligning: use the exported files for that.</figcaption>
+    Time is the PCG sample counter divided by 1000, as in the loader's pcg.npy (0 s = the first live PCG sample), and a dropped PCG frame is a gap.
+    The ECG is placed on it through the computer's time stamps of its frames, in 30 s blocks, which removes the slow drift between the two clocks.
+    The fixed delay between the ECG and PCG paths (about ±3 ms) is not measured and not corrected.
+    Labels (R and T-end) are proposed by the program and are yours to review: n and p go to the next and previous beat, u to the next unreviewed one, f to the next flagged one, Enter confirms the beat on screen and goes to the next unreviewed one.
+    Mark mode (button or m, off when the page opens): with r or t chosen, click a mark of that kind to remove it, drag it to move it, click anywhere else to add one (an R snaps to the nearest peak within 20 ms; a T-end replaces the one of the beat on its left); a drag on empty space still pans. It works with under 15 s on screen, and Ctrl+Z undoes it.
+    Mark mode off: click a label to select it and drag it, or use the arrow keys (1 ms, Shift 10 ms); Tab switches between its R and T, Esc lets go, Delete removes it (an R with its T-end). Shift+click adds an R (it snaps to the nearest peak within 20 ms), Ctrl+click sets the T-end of the beat on its left.
+    Zoomed out, labels are short ticks at the top of the traces. Save labels downloads <i>folder name</i>.labels.csv: keep it beside the recording folder, not inside it. Changes are also kept in this browser automatically.</figcaption>
 </figure>
 </main>
 <script type="module">
-import { segmentList, loadRecording, columns, timeAt, indexAt } from './viewer_data.js';
+import { segmentList, loadRecording, columns, BLOCK_S } from './viewer_data.js';
+import { tEnds, snapPeak } from './align.js';
+import { createLabels, fromBeats, groupBeats, counter, reviewed, writeLabels, readLabels, describeMap, DETECT } from './labels.js';
 
 const MIN_SPAN = 100; // ms
 const $ = (id) => document.getElementById(id);
@@ -74,15 +127,22 @@ const traces = [
   { key: 'ecg', name: 'ECG', card: $('cardEcg'), canvas: $('traceEcg'), color: '#0a70ec', unit: '' },
   { key: 'pcg', name: 'PCG', card: $('cardPcg'), canvas: $('tracePcg'), color: '#2e7d32', unit: ' counts' },
 ];
+const STYLE = { proposed: ['#e07b00', true], confirmed: ['#1b8a3a', false], edited: ['#1f5fd6', false], added: ['#8e24aa', false] }; // colour, dashed
 let rec = null, whole = null, view = null;
+let labels = null, sel = null, marking = false, beats = [], flagged = new Set(), lab = null, folder = '', detect = DETECT, key = '', saveTimer = 0; // sel: index in labels.list, lab: a drag in progress
 
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-const secs = (t) => (t - rec.t0) / 1000;
+const secs = (t) => t / 1000; // t: PCG ms
 const mmss = (s) => `${Math.floor(s / 60)}:${(s % 60).toFixed(1).padStart(4, '0')}`;
 
 $('pick').onchange = async (e) => {
   const files = [...e.target.files], list = segmentList(files.map((f) => f.name));
-  rec = null;
+  flush();
+  rec = labels = sel = null;
+  folder = files[0]?.webkitRelativePath.split('/')[0] ?? '';
+  $('tools').hidden = true;
+  $('trace05').checked = false;
+  $('note').textContent = '';
   for (const tr of traces) tr.card.hidden = true;
   for (const id of ['stats', 'warn', 'readout']) $(id).textContent = '';
   async function* read() {
@@ -101,32 +161,41 @@ $('pick').onchange = async (e) => {
   rec.errors = [...list.errors, ...rec.errors];
   for (const tr of traces) {
     tr.data = rec[tr.key];
-    tr.fit = rec[`${tr.key}Fit`];
-    tr.card.hidden = !(tr.fit && tr.data.length);
+    tr.axis = rec.axes[tr.key];
+    tr.card.hidden = !(tr.axis && tr.data.length);
   }
-  $('ecgTitle').textContent = `ECG lead II (LL − RA), ${rec.ecgSource === 'raw' ? 'zero-phase filtered' : 'stored forward-only trace'}`;
+  $('ecgTitle').textContent = ecgTitle();
   const shown = traces.filter((tr) => !tr.card.hidden);
   const warns = [...rec.errors];
   if (rec.segments && !rec.events.some((ev) => ev.e === 'stop')) warns.push('The recording was not closed cleanly (no stop event): the last 1.6 s or more may be lost.');
-  if (rec.drops) warns.push(`${rec.drops} PCG frames were dropped: the PCG after each is drawn 10 ms early.`);
-  if (rec.ecgResyncs.length) warns.push(`ECG lost sync ${rec.ecgResyncs.length} times: each stretch is filtered on its own, and the ECG after lost bytes is drawn early by the time lost.`);
+  if (rec.drops) warns.push(`${rec.drops} PCG frames were dropped: each is a gap in the PCG.`);
+  if (rec.ecgResyncs.length) warns.push(`ECG lost sync ${rec.ecgResyncs.length} times: each stretch is filtered and placed on its own.`);
+  if (rec.map?.short) warns.push(`${rec.map.short} ECG stretches under 10 s are placed by their straight line only.`);
+  const inside = files.filter((f) => f.name.endsWith('.labels.csv')).map((f) => f.name);
+  if (inside.length) warns.push(`This recording folder contains a label file (${inside.join(', ')}). Keep label files beside the recording folder, not inside it. This page does not read it unless you use Load labels.`);
   if (rec.ecgShort) warns.push(`${rec.ecgShort} ECG stretches were too short to filter and are left empty.`);
-  for (const ev of rec.events) if (ev.e === 'lost' || ev.e === 'read-error') warns.push(`${ev.e} on ${ev.stream} at ${secs(ev.t).toFixed(1)} s: ${ev.message}`);
+  for (const ev of rec.events) if (ev.e === 'lost' || ev.e === 'read-error') warns.push(`${ev.e} on ${ev.stream} at ${secs(rec.toPcgMs(ev.t)).toFixed(1)} s: ${ev.message}`);
   for (const tr of traces) if (tr.card.hidden) warns.push(`No ${tr.name} samples in this recording.`);
+  const chk = rec.check;
+  if (chk?.warn) warns.push(`S1 against R drifts by up to ${chk.worst.toFixed(1)} ms between 60 s blocks (limit ${chk.limitMs.toFixed(1)} ms): the ECG-to-PCG alignment of this recording is doubtful. Nothing was corrected.`);
   $('warn').textContent = warns.join('\n');
   if (!shown.length) {
     $('msg').textContent = 'Nothing to show.';
     return;
   }
-  whole = { lo: Math.min(...shown.map((tr) => timeAt(tr.fit, 0))), hi: Math.max(...shown.map((tr) => timeAt(tr.fit, tr.data.length - 1))) };
-  const [p, q] = [rec.pcgFit, rec.ecgFit];
+  whole = { lo: Math.min(...shown.map((tr) => tr.axis.timeAt(0))), hi: Math.max(...shown.map((tr) => tr.axis.timeAt(tr.data.length - 1))) };
+  const [p, q] = [rec.pcgFit, rec.ecgHz];
   const stop = rec.events.find((ev) => ev.e === 'stop'); // the samples end up to 1.6 s before the stop, which is what the loader counts
   $('msg').textContent = `${rec.segments} files, ${((stop ? stop.t - rec.t0 : whole.hi - whole.lo) / 1000).toFixed(1)} s from start to ${stop ? 'stop' : 'the last sample'}, `
     + `${stop ? `samples cover ${((whole.hi - whole.lo) / 1000).toFixed(1)} s, ` : ''}read in ${((performance.now() - start) / 1000).toFixed(1)} s.`;
   $('stats').textContent = `PCG ${rec.pcg.length.toLocaleString()} samples, ECG ${rec.ecg.length.toLocaleString()} samples, ${rec.drops} PCG drops, `
     + `${rec.events.some((ev) => ev.e === 'stop') ? 'clean stop' : 'no stop'}`
-    + (p && q ? `, PCG ${p.hz.toFixed(4)} Hz, ECG ${q.hz.toFixed(4)} Hz, ${((q.hz / p.hz - 1) * 1e6).toFixed(0)} ppm apart.` : '.')
+    + (p && q ? `, PCG ${p.hz.toFixed(4)} Hz, ECG ${q.toFixed(4)} Hz, ${((q / p.hz - 1) * 1e6).toFixed(0)} ppm apart.` : '.')
+    + (rec.map ? ` ECG on PCG time: ${BLOCK_S} s blocks, map moves the straight line by up to ${rec.map.maxC.toFixed(1)} ms.` : '')
+    + (rec.beats ? ` Proposed: ${rec.beats.length} R, ${rec.beats.filter((b) => Number.isFinite(b.e)).length} T-end, ${rec.beats.filter((b) => b.doubt.length).length} beats to look at first.` : '')
+    + (chk ? (chk.lags.length > 1 ? ` S1 against R in ${chk.lags.length} blocks of 60 s: ${Math.min(...chk.lags).toFixed(2)} to ${Math.max(...chk.lags).toFixed(2)} ms about the median${chk.warn ? ', over the limit' : ''}.` : ' S1 against R: too few beats to check.') : '')
     + (rec.ecgSource === 'raw' ? ' ECG: raw, zero phase.' : rec.ecg.length ? ' ECG: stored forward-only trace, about 10 ms late (no raw ECG in this recording).' : '');
+  if (rec.map && rec.pcg.length) startLabels();
   setView(whole.lo, whole.hi - whole.lo);
 };
 
@@ -144,7 +213,7 @@ function draw() {
     if (tr.card.hidden) continue;
     const c = tr.canvas, w = Math.round(c.clientWidth * dpr), h = Math.round(c.clientHeight * dpr);
     if (c.width !== w || c.height !== h) [c.width, c.height] = [w, h];
-    const g = c.getContext('2d'), { min, max } = columns(tr.data, tr.fit, view.a, view.b, w);
+    const g = c.getContext('2d'), { min, max } = columns(tr.data, tr.axis, view.a, view.b, w);
     let lo = Infinity, hi = -Infinity;
     for (let x = 0; x < w; x++) {
       if (min[x] < lo) lo = min[x];
@@ -163,42 +232,303 @@ function draw() {
     g.globalAlpha = 0.25;
     g.beginPath();
     for (let s = Math.ceil(secs(view.a) / step) * step; s <= secs(view.b); s += step) {
-      const x = Math.round(((s * 1000 + rec.t0 - view.a) / span) * w) + 0.5;
+      const x = Math.round(((s * 1000 - view.a) / span) * w) + 0.5;
       g.moveTo(x, 0), g.lineTo(x, h);
     }
     g.stroke();
     g.globalAlpha = 1;
-    for (let s = Math.ceil(secs(view.a) / step) * step; s <= secs(view.b); s += step) g.fillText(`${s.toFixed(digits)} s`, ((s * 1000 + rec.t0 - view.a) / span) * w + 3 * dpr, h - 4 * dpr);
+    for (let s = Math.ceil(secs(view.a) / step) * step; s <= secs(view.b); s += step) g.fillText(`${s.toFixed(digits)} s`, ((s * 1000 - view.a) / span) * w + 3 * dpr, h - 4 * dpr);
     g.fillText(hi.toFixed(0), 3 * dpr, 12 * dpr);
     g.fillText(lo.toFixed(0), 3 * dpr, h - 16 * dpr);
     g.strokeStyle = tr.color;
     g.lineWidth = dpr;
     g.beginPath();
-    if (span / tr.fit.b / w < 2) { // under 2 samples per column: the samples themselves
-      const i0 = Math.max(0, Math.floor(indexAt(tr.fit, view.a)));
-      for (let i = i0; i <= Math.min(tr.data.length - 1, Math.ceil(indexAt(tr.fit, view.b))); i++) {
-        const x = ((timeAt(tr.fit, i) - view.a) / span) * w;
-        if (i === i0) g.moveTo(x, y(tr.data[i])); else g.lineTo(x, y(tr.data[i]));
+    if (span / w < 2) { // under 2 samples per column (about 1 per ms): the samples themselves
+      const i0 = Math.max(0, Math.floor(tr.axis.indexAt(view.a)));
+      let pen = false; // a NaN sample lifts it
+      for (let i = i0; i <= Math.min(tr.data.length - 1, Math.ceil(tr.axis.indexAt(view.b))); i++) {
+        const x = ((tr.axis.timeAt(i) - view.a) / span) * w, v = tr.data[i];
+        if (Number.isNaN(v)) pen = false;
+        else {
+          if (pen) g.lineTo(x, y(v)); else g.moveTo(x, y(v));
+          pen = true;
+        }
       }
     } else {
       for (let x = 0; x < w; x++) if (!Number.isNaN(min[x])) g.moveTo(x + 0.5, y(max[x]) - 0.5), g.lineTo(x + 0.5, y(min[x]) + 0.5);
     }
     g.stroke();
+    if (labels) drawLabels(g, w, h, dpr);
   }
+}
+
+function drawLabels(g, w, h, dpr) {
+  const span = view.b - view.a, close = span <= 15000; // zoomed out, labels would hide the trace: short ticks at the top instead of lines and tags
+  labels.list.forEach((l, i) => {
+    if (l.state === 'deleted') return;
+    const x = (((lab?.i === i ? lab.t : l.t) * 1000 - view.a) / span) * w;
+    if (x < -10 || x > w + 10) return;
+    const [color, dashed] = STYLE[l.state];
+    g.strokeStyle = g.fillStyle = color;
+    g.lineWidth = (i === sel ? 3 : close ? 1.5 : 1) * dpr;
+    g.setLineDash(dashed && close ? [5 * dpr, 4 * dpr] : []);
+    g.beginPath();
+    g.moveTo(x, 0), g.lineTo(x, close ? h : (l.kind === 'R' ? 8 : 4) * dpr);
+    g.stroke();
+    if (close) g.fillText(l.kind + (flagged.has(l) ? '?' : ''), x + 3 * dpr, 24 * dpr);
+  });
+  g.setLineDash([]);
 }
 
 function readout(e) {
   const r = e.currentTarget.getBoundingClientRect(), t = view.a + ((e.clientX - r.left) / r.width) * (view.b - view.a), s = secs(t);
   for (const cur of document.querySelectorAll('.cur')) [cur.hidden, cur.style.left] = [false, `${e.clientX - r.left}px`];
   const at = (tr) => {
-    const i = Math.round(indexAt(tr.fit, t));
-    return tr.card.hidden ? '' : ` | ${tr.name} #${i} = ${i >= 0 && i < tr.data.length ? tr.data[i].toFixed(tr.key === 'pcg' ? 0 : 2) + tr.unit : 'none'}`;
+    const i = Math.round(tr.axis?.indexAt(t)), v = tr.data[i]; // PCG #n is round(t in ms): the loader's pcg.npy[n]
+    return tr.card.hidden ? '' : ` | ${tr.name} #${i} = ${Number.isFinite(v) ? v.toFixed(tr.key === 'pcg' ? 0 : 2) + tr.unit : 'none'}`;
   };
-  $('readout').textContent = `t = ${s.toFixed(3)} s${s >= 0 ? ` (${mmss(s)})` : ''}${traces.map(at).join('')} | view ${((view.b - view.a) / 1000).toFixed(2)} s`;
+  $('readout').textContent = `t = ${s.toFixed(3)} s${s >= 0 ? ` (${mmss(s)})` : ''}${[...traces].reverse().map(at).join('')} | view ${((view.b - view.a) / 1000).toFixed(2)} s`;
 }
 
+// ---- Labels: review, correction, file. The model (states, undo, CSV) is labels.js; this is the page around it.
+const ecgTitle = () => `ECG lead II (LL − RA), ${rec.ecgSource !== 'raw' ? 'stored forward-only trace' : $('trace05').checked ? 'labeling trace (0.5 Hz high-pass), zero-phase' : 'zero-phase filtered'}`;
+const note = (msg) => { $('note').textContent = msg; };
+const timeAt = (e, c) => { const r = c.getBoundingClientRect(); return view.a + ((e.clientX - r.left) / r.width) * (view.b - view.a); }; // PCG ms
+const want = () => ({ segments: rec.segments, pcg_samples: rec.pcg.length, ecg_frames: rec.ecgStamps.length }); // which recording a label file belongs to
+const csv = () => writeLabels(labels.list, { folder, ...want(), pcg_drops: rec.drops, map: describeMap(rec.map, BLOCK_S, rec.pcgFit), detect });
+
+function startLabels() {
+  const id = want();
+  let list = fromBeats(rec.beats ?? []);
+  key = `labels:${id.segments}:${id.pcg_samples}:${id.ecg_frames}`;
+  detect = DETECT;
+  try {
+    const kept = JSON.parse(localStorage.getItem(key) ?? 'null');
+    if (kept) {
+      const got = readLabels(kept.csv, id);
+      if (confirm(`Labels from an earlier session were saved automatically on ${new Date(kept.saved).toLocaleString()} (${got.list.length} labels). Restore them?`)) [list, detect] = [got.list, got.meta.detect ?? DETECT];
+    }
+  } catch (err) {
+    note(`The automatically saved labels could not be read and were left alone: ${err.message}`);
+  }
+  labels = createLabels(list);
+  $('tools').hidden = false;
+  refresh();
+}
+
+function refresh() { // the counter, the selection line and the buttons, after any change
+  beats = groupBeats(labels.list);
+  flagged = new Set(beats.filter((b) => !reviewed(b) && b.r.doubt).map((b) => b.r));
+  const c = counter(labels.list), l = labels.list[sel];
+  $('counter').textContent = `Reviewed ${c.reviewed} of ${c.beats} beats, ${c.flagged} flagged not yet reviewed`;
+  $('selinfo').textContent = l ? `Selected ${l.kind} at ${l.t.toFixed(3)} s, ${l.state}${l.doubt ? `, flagged: ${l.doubt.replaceAll(';', ', ')}` : ''}.` : '';
+  $('undo').disabled = !labels.canUndo;
+  $('redo').disabled = !labels.canRedo;
+}
+function update() {
+  refresh();
+  draw();
+}
+
+function changed() { // also keep a copy in this browser after 1 s without a change
+  update();
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flush, 1000);
+}
+
+function flush() { // also on pagehide and before another folder is opened, so the last change is not lost (nothing asks the user on close)
+  if (!saveTimer) return;
+  clearTimeout(saveTimer);
+  saveTimer = 0;
+  try {
+    localStorage.setItem(key, JSON.stringify({ saved: Date.now(), csv: csv() }));
+  } catch (err) {
+    note(`Automatic saving failed: ${err.message}. Use Save labels.`);
+  }
+}
+addEventListener('pagehide', flush);
+
+const beatOf = (l) => beats.find((b) => b.r === l || b.t === l);
+function goto(b, none) { // select the beat's R and show about 1.2 s around it, ECG and PCG together
+  if (!b) return note(none);
+  sel = labels.list.indexOf(b.r);
+  refresh();
+  setView(b.r.t * 1000 - 600, 1200);
+}
+// the nearest beat after (dir 1) or before (-1) the selected one, or the left edge of the view, that satisfies ok; wrap: u and f start again at the first
+function walk(dir, ok, none, wrap) {
+  const l = labels.list[sel], at = l ? beatOf(l)?.r.t ?? l.t : view.a / 1000, order = dir > 0 ? beats : [...beats].reverse();
+  goto(order.find((b) => dir * (b.r.t - at) > 1e-6 && ok(b)) ?? (wrap && order.find(ok)), none);
+}
+
+function hit(e, c, only) { // index of the label (of kind `only`, if given) within 6 px of the pointer, or -1
+  const r = c.getBoundingClientRect(), span = view.b - view.a, x = e.clientX - r.left;
+  let best = -1, d = 6.5;
+  labels.list.forEach((l, i) => {
+    const k = Math.abs(((l.t * 1000 - view.a) / span) * r.width - x);
+    if (l.state !== 'deleted' && (!only || l.kind === only) && k < d) [best, d] = [i, k];
+  });
+  return best;
+}
+
+// PCG ms of the peak of the labeling trace within 20 ms of tms (PCG ms), or null when there is no ECG there
+function snap(tms) {
+  const ax = rec.axes.ecg, k = snapPeak(rec.ecgLabel, Math.round(ax.indexAt(tms)));
+  return k === null ? null : ax.timeAt(k);
+}
+
+// The T-end of a hand-added R at t seconds, the way the detector finds it (needs the next R); NaN when there is none
+function proposeT(t) {
+  const next = labels.list.find((l) => l.kind === 'R' && l.state !== 'deleted' && l.t > t);
+  if (!next) return NaN;
+  const [m0, m1] = [rec.map.frameAt(t), rec.map.frameAt(next.t)], lo = Math.max(0, Math.floor(m0) - 100);
+  const x = Float32Array.from({ length: Math.ceil(m1) + 101 - lo }, (_, k) => rec.ecgLabel[2 * (lo + k)]);
+  return x.some(Number.isNaN) ? NaN : rec.map.timeOf(lo + tEnds(x, [m0 - lo, m1 - lo])[0].e);
+}
+
+function addR(tms, noDup) { // noDup (mark mode): refuse an R within 5 ms of a live one
+  const at = snap(tms);
+  if (at === null) return note('There is no ECG signal there to put an R on.');
+  if (noDup && labels.list.some((l) => l.kind === 'R' && l.state !== 'deleted' && Math.abs(l.t * 1000 - at) < 5)) return note('There is an R there already: click it to remove it, drag it to move it.');
+  const te = proposeT(at / 1000), k = labels.add(at / 1000, te);
+  if (k < 0) return;
+  sel = k;
+  changed();
+  note(`Added an R at ${(at / 1000).toFixed(3)} s${Number.isFinite(te) ? ' with a proposed T-end' : ' (no T-end could be proposed: Ctrl+click to set one)'}.`);
+}
+
+function setT(tms) {
+  const k = labels.setT(tms / 1000);
+  if (k < 0) return note('There is no beat to the left of that point.');
+  sel = k;
+  changed();
+}
+
+// ---- Mark mode: a press, a release, and one 4 px threshold between a click and a drag (see markUp)
+const kind = () => ($('kindT').checked ? 'T' : 'R');
+function modeUi() {
+  $('mark').setAttribute('aria-pressed', marking);
+  $('mark').textContent = `Mark mode: ${marking ? 'ON' : 'off'} (m)`;
+  $('mouse').textContent = marking
+    ? `Mouse: click a ${kind()} to remove it, drag it to move it, click elsewhere to add one; drag elsewhere pans. Works with under 15 s on screen.`
+    : 'Mouse: click or drag a label to select or move it, Shift+click adds an R, Ctrl+click sets a T-end, drag elsewhere pans.';
+}
+$('kindR').onchange = $('kindT').onchange = modeUi;
+modeUi();
+
+function markUp(p, e, c) { // p: the press (a mark of the chosen kind under it, p.i, or -1; p.moved: 4 px or more away at some point). Pointer released
+  if (p.far) return p.moved || note('Zoom in to mark (under 15 s of view).');
+  if (p.i >= 0 && p.moved) { // drag-to-move: one undo step for the whole drag
+    const j = labels.move(p.i, timeAt(e, c) / 1000);
+    if (j >= 0) sel = j;
+    return changed();
+  }
+  if (p.i >= 0) { // click on a mark: remove that mark only (the Delete key also takes the T-end of an R)
+    const l = labels.list[p.i];
+    if (labels.delete(p.i, true) < 0) return;
+    sel = null;
+    changed();
+    return note(`Removed the ${l.kind} at ${l.t.toFixed(3)} s. Ctrl+Z brings it back.`);
+  }
+  if (!p.moved) kind() === 'R' ? addR(p.t, true) : setT(p.t); // a click on empty space; a drag there was a pan
+}
+
+const hist = (f) => () => {
+  if (!labels[f]()) return;
+  sel = null;
+  changed();
+};
+const act = {
+  n: () => walk(1, () => true, 'This is the last beat.'),
+  p: () => walk(-1, () => true, 'This is the first beat.'),
+  u: () => walk(1, (b) => !reviewed(b), 'Every beat is reviewed.', true),
+  f: () => walk(1, (b) => !reviewed(b) && b.r.doubt, 'No flagged beat is left to review.', true),
+  enter() { // confirm the selected beat's R and T, then go to the next unreviewed beat; nothing selected: only go to one, never confirm unseen
+    const l = labels.list[sel], b = l && beatOf(l);
+    if (b && labels.confirm(...[b.r, b.t].filter(Boolean).map((x) => labels.list.indexOf(x))) >= 0) changed();
+    act.u();
+  },
+  del() {
+    if (sel === null) return note('Select a label first: click it, or press n.');
+    if (labels.delete(sel) < 0) return;
+    sel = null;
+    changed();
+  },
+  m() { marking = !marking; modeUi(); },
+  r() { $('kindR').checked = true; modeUi(); },
+  t() { $('kindT').checked = true; modeUi(); },
+  undo: hist('undo'),
+  redo: hist('redo'),
+  again() {
+    const d = labels.proposeAgain(rec.beats, true);
+    if (!d.replaced && !d.proposed) return note('There is nothing to propose again.');
+    if (!confirm(`Propose again keeps ${d.kept} labels (every one you confirmed, moved, added or deleted, and the T-end of a beat you added) and replaces ${d.replaced} proposed ones with ${d.proposed} new proposals. Ctrl+Z undoes it. Continue?`)) return;
+    labels.proposeAgain(rec.beats);
+    sel = null;
+    changed();
+  },
+  save() { // a download, so the page holds no write access to anything; the browser or Electron decides where it goes
+    const a = document.createElement('a'), name = `${folder || 'recording'}.labels.csv`;
+    a.href = URL.createObjectURL(new Blob([csv()], { type: 'text/csv' }));
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    note(`Saved ${name} (${labels.list.length} labels) to your downloads. Keep it beside the recording folder, not inside it.`);
+  },
+};
+const KEYS = { n: 'n', p: 'p', u: 'u', f: 'f', m: 'm', r: 'r', t: 't', Enter: 'enter', Delete: 'del' };
+
+$('tools').addEventListener('click', (e) => {
+  const k = e.target.dataset?.act;
+  if (k && labels) act[k]();
+});
+$('trace05').onchange = (e) => {
+  traces[0].data = e.target.checked ? rec.ecgLabel : rec.ecg;
+  $('ecgTitle').textContent = ecgTitle();
+  draw();
+};
+$('loadFile').onchange = async (e) => {
+  const f = e.target.files[0];
+  e.target.value = ''; // so the same file can be chosen again
+  if (!f || !labels) return;
+  try {
+    const got = readLabels(await f.text(), want()), mine = counter(labels.list).reviewed;
+    if (mine && !confirm(`Loading ${f.name} replaces the labels on screen, including the ${mine} beats you reviewed (this cannot be undone). Continue?`)) return;
+    [labels, sel, detect] = [createLabels(got.list), null, got.meta.detect ?? DETECT];
+    changed();
+    note(`Loaded ${got.list.length} labels from ${f.name}.`);
+  } catch (err) {
+    note(`Could not load the labels: ${err.message}`);
+  }
+};
+// capture phase: with a label selected the arrow keys move it instead of panning
+document.addEventListener('keydown', (e) => {
+  if (!labels || !view || e.altKey || e.metaKey) return; // Enter is ours even with a button focused (Space still presses buttons)
+  const k = e.key, l = labels.list[sel];
+  if (e.ctrlKey) {
+    if (k === 'z') act.undo();
+    else if (k === 'y') act.redo();
+    else return;
+  } else if (KEYS[k]) act[KEYS[k]]();
+  else if (k === 'Escape' && l) {
+    sel = null;
+    update();
+  } else if (l && (k === 'ArrowLeft' || k === 'ArrowRight')) { // shortcut: one undo step per key press (100 deep), upgrade if nudging needs coalescing
+    const j = labels.move(sel, l.t + (k === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 0.01 : 0.001));
+    if (j >= 0) sel = j;
+    changed();
+  } else if (k === 'Tab' && l && !e.target.matches('button, input')) { // R and T of the beat; Esc lets go, and Tab then reaches the buttons again
+    const b = beatOf(l), o = b && (l === b.r ? b.t : b.r);
+    if (!o) return;
+    sel = labels.list.indexOf(o);
+    update();
+  } else return;
+  e.preventDefault();
+  e.stopPropagation();
+}, true);
+
 for (const { canvas } of traces) {
-  let drag = null;
+  let drag = null, press = null;
   canvas.addEventListener('wheel', (e) => {
     if (!rec) return;
     e.preventDefault();
@@ -210,17 +540,49 @@ for (const { canvas } of traces) {
   canvas.addEventListener('pointerdown', (e) => {
     if (!rec) return;
     canvas.setPointerCapture(e.pointerId);
-    drag = { x: e.clientX, a: view.a };
+    if (labels && marking) { // mark mode: the gesture is decided at pointerup; Shift, Ctrl and Alt clicks do nothing
+      if (e.button || e.shiftKey || e.ctrlKey || e.altKey) return;
+      const far = view.b - view.a > 15000; // zoomed out, 6 px is several beats: no marking
+      press = { x: e.clientX, y: e.clientY, a: view.a, t: timeAt(e, canvas), far, i: far ? -1 : hit(e, canvas, kind()), moved: false };
+      return;
+    }
+    if (labels && (e.shiftKey || e.ctrlKey)) return e.shiftKey ? addR(timeAt(e, canvas)) : setT(timeAt(e, canvas));
+    const i = labels ? hit(e, canvas) : -1; // a press within 6 px of a label drags it, anywhere else pans
+    if (i >= 0) {
+      [sel, lab] = [i, { i, x: e.clientX, t: labels.list[i].t, moved: false }];
+      refresh();
+      draw();
+    } else drag = { x: e.clientX, a: view.a };
   });
   canvas.addEventListener('pointermove', (e) => {
     if (!rec) return;
-    if (drag) setView(drag.a - ((e.clientX - drag.x) / canvas.clientWidth) * (view.b - view.a), view.b - view.a);
+    if (press) {
+      press.moved ||= Math.hypot(e.clientX - press.x, e.clientY - press.y) >= 4; // once a drag, still a drag if the pointer comes back
+      if (press.moved && press.i >= 0) {
+        lab = { i: press.i, t: timeAt(e, canvas) / 1000 }; // drawn at the pointer, saved at pointerup
+        draw();
+      } else if (press.moved) setView(press.a - ((e.clientX - press.x) / canvas.clientWidth) * (view.b - view.a), view.b - view.a);
+    } else if (lab) {
+      lab.moved ||= Math.abs(e.clientX - lab.x) >= 2;
+      if (lab.moved) {
+        lab.t = timeAt(e, canvas) / 1000;
+        draw();
+      }
+    } else if (drag) setView(drag.a - ((e.clientX - drag.x) / canvas.clientWidth) * (view.b - view.a), view.b - view.a);
     readout(e);
   });
-  canvas.addEventListener('pointerup', () => { drag = null; });
+  canvas.addEventListener('pointerup', (e) => {
+    const d = lab, p = press;
+    [lab, drag, press] = [null, null, null];
+    if (p) return markUp(p, e, canvas);
+    if (!d?.moved) return;
+    const k = labels.move(d.i, d.t); // one undo step for the whole drag
+    if (k >= 0) sel = k;
+    changed();
+  });
   canvas.addEventListener('pointerleave', () => { for (const cur of document.querySelectorAll('.cur')) cur.hidden = true; });
   canvas.addEventListener('dblclick', (e) => {
-    if (!rec || !whole) return;
+    if (!rec || !whole || (labels && marking)) return; // mark mode: its first click would add a mark (Home still shows all)
     setView(whole.lo, whole.hi - whole.lo);
     readout(e);
   });

@@ -63,7 +63,42 @@ test('a recording decodes to its samples and its two rates', async () => {
   assert.deepEqual(r.events.map((e) => e.e), ['start', 'stop']);
   assert.equal(r.t0, 500);
   assert.ok(Math.abs(r.pcgFit.hz / 1001 - 1) < 5e-6, `pcg ${r.pcgFit.hz}`);
-  assert.ok(Math.abs(r.ecgFit.hz / 999.5 - 1) < 5e-6, `ecg ${r.ecgFit.hz}`);
+  assert.ok(Math.abs(r.ecgHz / 999.5 - 1) < 5e-6, `ecg ${r.ecgHz}`); // no raw ECG here: the stored trace, through a line
+  assert.equal(r.map, null);
+  assert.equal(r.axes.pcg.timeAt(12345), 12345); // PCG time in ms is the sample index
+  assert.ok(Math.abs(r.axes.ecg.indexAt(r.axes.ecg.timeAt(777)) - 777) < 1e-6);
+  const span = r.axes.ecg.timeAt(2000) - r.axes.ecg.timeAt(0); // 2000 ECG samples at 999.5 Hz last 2000 * 1001 / 999.5 PCG ms
+  assert.ok(Math.abs(span - 2000 * (1001 / 999.5)) < 0.5, `span ${span}`);
+});
+
+// PCG frames cut in odd chunks, one frame missing by seq: every frame is stamped by the chunk that held its last byte, and a time is an index
+test('PCG frames are stamped like the loader and a dropped frame stays as 10 NaN', async () => {
+  const N = 200, HOLE = 60, order = [-1, ...Array.from({ length: N }, (_, k) => k).filter((k) => k !== HOLE)]; // -1: the stale frame
+  const bytes = new Uint8Array(24 * order.length);
+  order.forEach((k, f) => bytes.set(k < 0 ? pcgFrame(5, 0) : pcgFrame(100 + k, k), 24 * f));
+  const files = [], log = createLog(async (_, blob) => files.push(await blob.arrayBuffer())), byteChunk = [];
+  const sizes = [1, 5, 17, 37, 23];
+  for (let p = 0, c = 0; p < bytes.length; c++) {
+    const end = Math.min(bytes.length, p + sizes[c % sizes.length]);
+    log.add(1000 + 3 * c, [1, bytes.subarray(p, end)]);
+    byteChunk.push(...Array(end - p).fill(c));
+    p = end;
+  }
+  assert.ok(await log.flush());
+  const r = await loadRecording(feed(files));
+  assert.deepEqual(r.errors, []);
+  assert.equal(r.drops, 1);
+  assert.equal(r.pcg.length, 10 * (N - 1)); // the last frame waits for a next header; the hole is in the middle
+  assert.equal(r.pcgFrameT.length, N - 2);
+  r.pcgFrameT.forEach((t, j) => {
+    const k = j + (j + 1 > HOLE ? 1 : 0), f = order.indexOf(k); // frame k: the j-th live one, counting past the hole
+    assert.equal(t, 1000 + 3 * byteChunk[24 * f + 23], `frame ${k}`);
+    assert.equal(r.pcgFrameIndex[j], 10 * k);
+  });
+  for (let i = 0; i < r.pcg.length; i++) {
+    if (i >= 10 * HOLE && i < 10 * HOLE + 10) assert.ok(Number.isNaN(r.pcg[i]), `index ${i}`);
+    else assert.equal(r.pcg[i], SAMPLE(Math.floor(i / 10), i % 10), `index ${i}`);
+  }
 });
 
 test('a cut segment and a missing number are reported, and nothing throws', async () => {
@@ -82,12 +117,12 @@ test('a cut segment and a missing number are reported, and nothing throws', asyn
 test('columns keeps a single spike in a million samples', () => {
   const s = new Int16Array(1e6);
   s[777777] = 5000;
-  const fit = { i0: 0, t0: 0, a: 0, b: 1, hz: 1000 };
-  const c = columns(s, fit, 0, 1e6, 1000);
+  const axis = { indexAt: (t) => t }; // 1 sample per ms of PCG time
+  const c = columns(s, axis, 0, 1e6, 1000);
   assert.equal(c.max[777], 5000);
   assert.equal(c.max.reduce((m, v, x) => m + (x === 777 || v === 0 ? 0 : 1), 0), 0);
   assert.ok(c.min.every((v) => v === 0));
-  assert.ok(columns(s, fit, 2e6, 3e6, 10).max.every(Number.isNaN)); // outside the data
+  assert.ok(columns(s, axis, 2e6, 3e6, 10).max.every(Number.isNaN)); // outside the data
 });
 
 // 40-byte ECG frames (protocol section 8: 01 C0, 02 C0, 03 C0 markers, lead II big-endian at byte 8), each part cut in chunks of odd sizes.
@@ -131,7 +166,8 @@ test('the ECG is filtered forward and backward like scipy, then upsampled to 100
   const expected = { 0: -30.963467, 1: -24.992767, 2: -17.349284, 3: -9.705801, 400: -103.054814, 401: -102.642974, 555: -263.35002, 556: -266.767549,
     795: 144.242767, 796: 138.623187, 797: 133.003607, 798: 129.122544 };
   for (const [i, v] of Object.entries(expected)) assert.ok(Math.abs(r.ecg[i] - v) < 1e-3, `sample ${i}: ${r.ecg[i]} against ${v}`);
-  assert.ok(Math.abs(r.ecgFit.hz / (1000 / (MS_PER_FRAME / 2)) - 1) < 5e-6, `ecg ${r.ecgFit.hz}`);
+  assert.ok(Math.abs(r.ecgHz / (1000 / (MS_PER_FRAME / 2)) - 1) < 5e-6, `ecg ${r.ecgHz}`);
+  assert.equal(r.ecgStamps.length, 400); // one host stamp per frame, rising
 });
 
 test('a symmetric pulse comes out symmetric about its own time', async () => {
@@ -149,6 +185,9 @@ test('a resync cuts the ECG in two runs joined by one empty sample, each filtere
   assert.deepEqual(r.ecgResyncs, [200]);
   assert.equal(r.ecg.length, 799);
   assert.ok(Number.isNaN(r.ecg[399]));
+  assert.ok(r.ecgStamps.every((t, m) => m === 0 || t >= r.ecgStamps[m - 1])); // the stamps are per frame and run past the cut
+  assert.equal(r.ecgStamps.length, 400);
+  assert.equal(r.map.runs.length, 2);
   assert.deepEqual(r.ecg.slice(0, 399), a.ecg);
   assert.deepEqual(r.ecg.slice(400), b.ecg);
 });

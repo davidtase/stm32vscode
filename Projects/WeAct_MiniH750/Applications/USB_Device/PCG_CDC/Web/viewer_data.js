@@ -1,6 +1,7 @@
 // Decoder of a saved ECG + PCG recording for viewer.html, with no DOM, so node can test it. The file format is the one in
-// recorder.js and Tools/load_recording.py. Raw bytes are not kept: only the decoded samples, which are 28 times smaller.
-import { createParser } from './pcg_parser.js';
+// recorder.js and Tools/load_recording.py. Raw bytes are not kept, except the PCG's (1.5 MB per 10 minutes), which are walked as the loader does.
+// Time is PCG time: milliseconds = PCG sample index, index 0 = the first live frame's first sample, as in the loader's pcg.npy.
+import { buildMap, filtfilt, findBeats, alignCheck, HP05 } from './align.js';
 import { createParser as createEcgParser } from './ecg_dsp.js';
 import { createUpsampler } from './upsample.js';
 
@@ -45,12 +46,12 @@ function sink(Type) {
 }
 
 // The recorder's ECG filters (protocol section 12.2, [b, a] at 500 Hz), copied because ecg_dsp.js keeps them private. The tests check them
-const HP = [[0.997781024102941, -1.99556204820588, 0.997781024102941], [1, -1.99555712434579, 0.995566972065975]];
-const NF = [
+export const HP = [[0.997781024102941, -1.99556204820588, 0.997781024102941], [1, -1.99555712434579, 0.995566972065975]];
+export const NF = [
   [0.951558090821252, -2.1284207536999, 2.85527558178394, -2.1284207536999, 0.951558090821252],
   [1, -2.18192506761969, 2.85407296314357, -2.07491643978012, 0.904318800282871],
 ];
-const HF = [
+export const HF = [
   [0.987761389276826, -3.9510455571073, 5.92656833566095, -3.9510455571073, 0.987761389276826],
   [1, -3.97537191256092, 5.92641855596542, -3.92671919775679, 0.975672562146085],
 ];
@@ -58,39 +59,15 @@ const H40 = [
   -0.00812031626499363, 0.00279430037155961, 0.0363062486230826, 0.0960723789024121, 0.163761187856556, 0.209186200511384,
   0.209186200511384, 0.163761187856556, 0.0960723789024121, 0.0363062486230826, 0.00279430037155961, -0.00812031626499363,
 ];
+export const BLOCK_S = 30; // seconds per block of the ECG-to-PCG map
 const PAD = 15; // filtfilt pads 3 * the longest coefficient list (5) on both ends: a run of PAD frames or fewer cannot be filtered
 
-// scipy.signal.lfilter, direct form II transposed, from state z (changed)
-function lfilter([b, a], x, z) {
-  const n = z.length, y = new Float64Array(x.length);
-  for (let i = 0; i < x.length; i++) {
-    const o = b[0] * x[i] + z[0];
-    for (let k = 0; k < n; k++) z[k] = (k + 1 < n ? z[k + 1] : 0) + b[k + 1] * x[i] - a[k + 1] * o;
-    y[i] = o;
-  }
-  return y;
-}
-
-// scipy.signal.filtfilt with its defaults (odd extension of 3 * len(b), start from the steady state), on a run of more than 3 * len(b) samples
-function filtfilt(ba, x) {
-  const [b, a] = ba, n = x.length, pad = 3 * b.length, g = b.reduce((s, v) => s + v) / a.reduce((s, v) => s + v);
-  const zi = new Float64Array(b.length - 1); // lfilter_zi: the state of a constant input of 1
-  for (let k = b.length - 2, s = 0; k >= 0; k--) zi[k] = s += b[k + 1] - a[k + 1] * g;
-  const e = new Float64Array(n + 2 * pad);
-  for (let i = 0; i < pad; i++) {
-    e[i] = 2 * x[0] - x[pad - i];
-    e[pad + n + i] = 2 * x[n - 1] - x[n - 2 - i];
-  }
-  e.set(x, pad);
-  const pass = (s) => lfilter(ba, s, zi.map((v) => v * s[0])).reverse();
-  return pass(pass(e)).subarray(pad, pad + n);
-}
-
-// One run of raw lead II counts to 2n - 1 samples at 1000 Hz, sample 2m being frame m. The three IIR stages go forward and backward;
-// the 12-tap FIR is symmetric, so one causal pass and a shift of its 5.5 samples = 11 samples at 1000 Hz centre it. Its ends repeat the edge values
-function zeroPhase(x) {
+// One run of raw lead II counts to 2n - 1 samples at 1000 Hz, sample 2m being frame m. The IIR stages go forward and backward;
+// the 12-tap FIR is symmetric, so one causal pass and a shift of its 5.5 samples = 11 samples at 1000 Hz centre it. Its ends repeat the edge values.
+// stages: the viewer's trace by default, the labeling trace (one 0.5 Hz high-pass in place of the 0.25 and 0.75 Hz ones) for the detectors
+export function zeroPhase(x, stages = [HP, NF, HF]) {
   let y = Float64Array.from(x);
-  for (const stage of [HP, NF, HF]) y = filtfilt(stage, y);
+  for (const stage of stages) y = filtfilt(stage, y);
   const M = y.length, up = createUpsampler(2), out = new Float32Array(2 * (M + 6) - 1);
   let o = 0;
   for (let m = 0; m < M + 6; m++) {
@@ -102,7 +79,7 @@ function zeroPhase(x) {
 }
 
 // Least squares line t = t0 + a + b * (index - i0) through (index, t) pairs, as running sums so no pair is kept.
-// b is ms per sample. Not a correction of the recording: it only places the trace on the host clock for display
+// b is ms per sample. Not a correction of the recording: it only tells the host clock from the PCG one
 function fitter() {
   let n = 0, i0 = 0, t0 = 0, sx = 0, sy = 0, sxx = 0, sxy = 0;
   return {
@@ -120,12 +97,37 @@ function fitter() {
   };
 }
 
+// The PCG frames as Tools/load_recording.py finds them: 24 bytes [0x8000][seq][10 int16], a frame counts when the header of the next
+// one follows 24 bytes later, the first (stale) one is left out. Each frame is stamped with the chunk that held its last byte, and a
+// dropped frame stays in the array as 10 NaN, so an index is a time. ends: cumulative byte count at the end of each chunk, ts: its stamp
+function pcgFrames(b, ends, ts) {
+  const ok = (c) => b[c] === 0 && b[c + 1] === 0x80 && b[c + 3] < 0x80, seq = (c) => b[c + 2] | (b[c + 3] << 8), starts = [];
+  for (let c = 0; c + 28 <= b.length; c++) {
+    if (ok(c) && ok(c + 24) && seq(c) !== seq(c + 24)) starts.push(c), c += 23;
+  }
+  const live = starts.slice(1), index = new Float64Array(live.length), t = new Float64Array(live.length);
+  let n = 0, drops = 0, k = 0;
+  live.forEach((c, j) => {
+    if (j) {
+      const gap = (seq(c) - seq(live[j - 1]) - 1) & 0x7fff;
+      drops += gap;
+      n += gap + 1;
+    }
+    index[j] = 10 * n;
+    while (ends[k] < c + 24) k++;
+    t[j] = ts[k];
+  });
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength), pcg = new Float32Array(live.length ? 10 * (n + 1) : 0).fill(NaN);
+  live.forEach((c, j) => { for (let i = 0; i < 10; i++) pcg[index[j] + i] = dv.getInt16(c + 4 + 2 * i, true); });
+  return { pcg, index, t, drops };
+}
+
 // chunks: async iterable of ArrayBuffer, one per segment in number order. Never throws on a damaged recording
 export async function loadRecording(chunks) {
-  const errors = [], events = [], pcgSink = sink(Int16Array), ecgSink = sink(Float32Array), rawSink = sink(Int16Array);
-  const pcgFit = fitter(), ecgFit = fitter(), rawFit = fitter(), parser = createParser(), ecgParser = createEcgParser();
+  const errors = [], events = [], pcgBytes = sink(Uint8Array), ecgSink = sink(Float32Array), rawSink = sink(Int16Array), stampSink = sink(Float64Array);
+  const ecgFit = fitter(), ecgParser = createEcgParser(), pcgEnds = [], pcgTs = [];
   const ecgResyncs = []; // frame numbers where a run of raw ECG frames starts after a resync
-  let segments = 0, first = null, startT = null, stale = true, resync = false;
+  let segments = 0, first = null, startT = null, resync = false;
 
   for await (const buf of chunks) {
     const dv = new DataView(buf), name = `file ${++segments}`;
@@ -143,12 +145,9 @@ export async function loadRecording(chunks) {
       }
       first ??= t;
       if (kind === PCG) {
-        let kept = 0;
-        for (const f of parser.push(new Uint8Array(buf, at, n))) {
-          if (stale) stale = false; // the device queues one stale frame while the port is closed
-          else { pcgSink.push(f); kept++; }
-        }
-        if (kept) pcgFit.add(pcgSink.length - 1, t);
+        pcgBytes.push(new Uint8Array(buf, at, n));
+        pcgEnds.push(pcgBytes.length);
+        pcgTs.push(t);
       } else if (kind === ECG) {
         const { stats } = ecgParser, [locked, skipped] = [stats.frames > 0, stats.skipped];
         const frames = ecgParser.push(new Uint8Array(buf, at, n));
@@ -158,7 +157,7 @@ export async function loadRecording(chunks) {
           if (resync) ecgResyncs.push(rawSink.length);
           resync = false;
           rawSink.push(frames.map((f) => f[1])); // lead II
-          rawFit.add(2 * (rawSink.length - 1), t); // in the 1000 Hz index space, where frame m is sample 2m
+          stampSink.push(new Float64Array(frames.length).fill(t)); // each frame: the chunk that held its last byte
         }
       } else if (kind === ECG_1K) {
         if (n % 4) errors.push(`${name}: a filtered ECG record of ${n} bytes is not whole samples`);
@@ -185,42 +184,48 @@ export async function loadRecording(chunks) {
   // fallback for a recording with no raw frames
   const raw = rawSink.done();
   let ecgShort = 0; // runs too short to filter, left NaN
-  let ecg = ecgSink.done();
+  let ecg = ecgSink.done(), ecgLabel = null;
   if (raw.length) {
     ecg = new Float32Array(2 * raw.length - 1).fill(NaN);
+    ecgLabel = ecg.slice();
     [0, ...ecgResyncs].forEach((s, r) => {
       const x = raw.subarray(s, ecgResyncs[r] ?? raw.length);
-      if (x.length > PAD) ecg.set(zeroPhase(x), 2 * s);
+      if (x.length > PAD) [ecg.set(zeroPhase(x), 2 * s), ecgLabel.set(zeroPhase(x, [HP05, NF]), 2 * s)];
       else ecgShort++;
     });
   }
+  const { pcg, index, t: pcgT, drops } = pcgFrames(pcgBytes.done(), pcgEnds, pcgTs), pcgLine = fitter();
+  index.forEach((i, j) => pcgLine.add(i, pcgT[j]));
+  const pcgFit = pcgLine.done(), line = pcgFit ?? { i0: 0, t0: first ?? 0, a: 0, b: 1, hz: 1000 }; // no PCG: time is ms since the first record
+  const stamps = stampSink.done(), map = raw.length ? buildMap(stamps, ecgResyncs, line, BLOCK_S) : null, stored = raw.length ? null : ecgFit.done();
+  // R and T-end proposals on the labeling trace, and the check of the map against the PCG's S1
+  const beats = map ? findBeats(raw, ecgLabel, [0, ...ecgResyncs], map) : null, check = beats?.length ? alignCheck(pcg, beats.map((b) => 1000 * b.t)) : null;
+  // Both traces on PCG time, in ms (the PCG's is its own index). The stored forward-only trace goes through the PCG line instead of the map
+  const toPcgMs = (host) => (host - line.t0 - line.a) / line.b + line.i0, toHost = (t) => line.t0 + line.a + line.b * (t - line.i0);
+  const ecgAxis = map ? { timeAt: (i) => 1000 * map.timeOf(i / 2), indexAt: (t) => 2 * map.frameAt(t / 1000) }
+    : stored && { timeAt: (i) => toPcgMs(stored.t0 + stored.a + stored.b * (i - stored.i0)), indexAt: (t) => stored.i0 + (toHost(t) - stored.t0 - stored.a) / stored.b };
   return {
-    pcg: pcgSink.done(), ecg, pcgFit: pcgFit.done(),
-    ecgFit: raw.length ? rawFit.done() : ecgFit.done(), ecgSource: raw.length ? 'raw' : 'stored', ecgResyncs, ecgShort,
-    t0: startT ?? first, events, segments, drops: parser.stats.drops, errors,
+    pcg, ecg, ecgLabel, beats, check, pcgFit, pcgFrameT: pcgT, pcgFrameIndex: index, ecgStamps: stamps, map, ecgHz: map ? 2 * map.frameHz : stored?.hz,
+    axes: { pcg: { timeAt: (i) => i, indexAt: (t) => t }, ecg: ecgAxis }, toPcgMs,
+    ecgSource: raw.length ? 'raw' : 'stored', ecgResyncs, ecgShort, t0: startT ?? first, events, segments, drops, errors,
   };
 }
 
-// Host time in ms of sample i, and the other way round
-export const timeAt = (fit, i) => fit.t0 + fit.a + fit.b * (i - fit.i0);
-export const indexAt = (fit, t) => fit.i0 + (t - fit.t0 - fit.a) / fit.b;
-
-// For each of width pixel columns between host times t0 and t1 (ms): the min and max of the samples that fall in it,
-// NaN where none does. A single-sample spike is therefore always the max of its column, at any zoom
-export function columns(samples, fit, t0, t1, width) {
+// For each of width pixel columns between PCG times t0 and t1 (ms): the min and max of the samples that fall in it, NaN where none does.
+// axis.indexAt(t) is the fractional index of the samples at time t. A single-sample spike is therefore always the max of its column, at any zoom
+export function columns(samples, axis, t0, t1, width) {
   const min = new Float32Array(width).fill(NaN), max = new Float32Array(width).fill(NaN);
-  let lo = Math.max(0, Math.ceil(indexAt(fit, t0)));
+  let lo = Math.max(0, Math.ceil(axis.indexAt(t0)));
   for (let x = 0; x < width; x++) {
-    const hi = Math.min(samples.length, Math.ceil(indexAt(fit, t0 + ((x + 1) * (t1 - t0)) / width)));
+    const hi = Math.min(samples.length, Math.ceil(axis.indexAt(t0 + ((x + 1) * (t1 - t0)) / width)));
     if (hi > lo) {
-      let a = samples[lo], b = a;
-      for (let i = lo + 1; i < hi; i++) {
+      let a = Infinity, b = -Infinity; // NaN samples (a dropped frame, the join of two ECG runs) are skipped
+      for (let i = lo; i < hi; i++) {
         const v = samples[i];
         if (v < a) a = v;
-        else if (v > b) b = v;
+        if (v > b) b = v;
       }
-      min[x] = a;
-      max[x] = b;
+      if (a <= b) [min[x], max[x]] = [a, b];
     }
     lo = Math.max(lo, hi);
   }
